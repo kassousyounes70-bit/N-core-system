@@ -24,18 +24,17 @@ jobs:
         with:
           python-version: '3.x'
 
+      - name: Setup Gradle Environment
+        uses: gradle/actions/setup-gradle@v3
+
       - name: Generate Complete Android NDK Project Structure
         run: python generate_project.py
 
-      - name: Make Gradle Executable
-        run: chmod +x gradlew
-
       - name: Build Debug APK via Gradle
-        run: ./gradlew assembleDebug --stacktrace
+        run: gradle assembleDebug --stacktrace
 
       - name: Upload Generated APK
         uses: actions/upload-artifact@v4
         with:
           name: NCore-Native-Engine-APK
           path: app/build/outputs/apk/debug/app-debug.apk
-          
