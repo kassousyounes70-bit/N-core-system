@@ -198,8 +198,8 @@ Java_com_ncore_engine_MainActivity_parseAndRenderNativeUI(
 
     // Obtain Java classes via reflection
     jclass mainActivityClass = env->GetObjectClass(instance);
-    jmethodid addTextViewMethod = env->GetMethodID(mainActivityClass, "addNativeTextView", "(Ljava/lang/String;)V");
-    jmethodid addButtonMethod = env->GetMethodID(mainActivityClass, "addNativeButton", "(Ljava/lang/String;)V");
+    jmethodID addTextViewMethod = env->GetMethodID(mainActivityClass, "addNativeTextView", "(Ljava/lang/String;)V");
+    jmethodID addButtonMethod = env->GetMethodID(mainActivityClass, "addNativeButton", "(Ljava/lang/String;)V");
 
     size_t index = 15; // Skip Magic Header bytes
 
