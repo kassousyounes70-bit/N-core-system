@@ -7,7 +7,7 @@ def create_file(path, content):
     with open(path, "w", encoding="utf-8") as f:
         f.write(content.strip() + "\n")
 
-print("[*] Generating Upgraded NCore Custom Native Rendering Engine...")
+print("[*] Generating Upgraded NCore Custom Native & Web Hybrid Rendering Engine...")
 
 # 1. Root Settings & Build Scripts
 create_file("settings.gradle", """
@@ -102,6 +102,10 @@ dependencies {
 create_file("app/src/main/AndroidManifest.xml", """
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+
     <application
         android:allowBackup="true"
         android:icon="@android:drawable/sym_def_app_icon"
@@ -363,7 +367,7 @@ Java_com_ncore_engine_MainActivity_executeNCoreBytecode(JNIEnv* env, jobject ins
 }
 """)
 
-# 6. Android MainActivity Host (UI, Native Dynamic Styling Bridge)
+# 6. Android MainActivity Host (UI, Native Dynamic Styling Bridge & Full Dedicated Browser Engine)
 create_file("app/src/main/java/com/ncore/engine/MainActivity.java", """
 package com.ncore.engine;
 
@@ -373,9 +377,16 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.view.View;
 import android.view.ViewGroup;
+import android.webkit.WebChromeClient;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
 import android.widget.Button;
+import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 import androidx.activity.result.ActivityResultLauncher;
@@ -385,6 +396,7 @@ import androidx.appcompat.app.AppCompatActivity;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -397,6 +409,8 @@ public class MainActivity extends AppCompatActivity {
 
     private byte[] importedHtmlBytes = null;
     private LinearLayout uiContainer;
+    private ScrollView nativeScrollView;
+    private WebView webView;
 
     private final ActivityResultLauncher<Intent> selectHtmlLauncher = registerForActivityResult(
             new ActivityResultContracts.StartActivityForResult(),
@@ -411,7 +425,14 @@ public class MainActivity extends AppCompatActivity {
                             buffer.write(data, 0, nRead);
                         }
                         importedHtmlBytes = buffer.toByteArray();
-                        Toast.makeText(this, "HTML Imported successfully!", Toast.LENGTH_SHORT).show();
+
+                        // Render HTML directly into Dedicated Web Browser Engine
+                        String htmlContent = new String(importedHtmlBytes, StandardCharsets.UTF_8);
+                        nativeScrollView.setVisibility(View.GONE);
+                        webView.setVisibility(View.VISIBLE);
+                        webView.loadDataWithBaseURL("file:///android_asset/", htmlContent, "text/html", "UTF-8", null);
+
+                        Toast.makeText(this, "HTML Imported & Loaded in Browser Engine!", Toast.LENGTH_SHORT).show();
                     } catch (Exception e) {
                         e.printStackTrace();
                     }
@@ -449,7 +470,9 @@ public class MainActivity extends AppCompatActivity {
                         while ((nRead = is.read(data, 0, data.length)) != -1) {
                             buffer.write(data, 0, nRead);
                         }
-                        
+
+                        webView.setVisibility(View.GONE);
+                        nativeScrollView.setVisibility(View.VISIBLE);
                         uiContainer.removeAllViews();
                         executeNCoreBytecode(buffer.toByteArray());
                         Toast.makeText(this, "Rendered with NCore Native Engine!", Toast.LENGTH_SHORT).show();
@@ -466,7 +489,12 @@ public class MainActivity extends AppCompatActivity {
 
         LinearLayout rootLayout = new LinearLayout(this);
         rootLayout.setOrientation(LinearLayout.VERTICAL);
-        rootLayout.setPadding(32, 32, 32, 32);
+        rootLayout.setPadding(16, 16, 16, 16);
+
+        HorizontalScrollView topBarScroll = new HorizontalScrollView(this);
+        topBarScroll.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
 
         LinearLayout controlsLayout = new LinearLayout(this);
         controlsLayout.setOrientation(LinearLayout.HORIZONTAL);
@@ -480,20 +508,63 @@ public class MainActivity extends AppCompatActivity {
         Button btnOpenRun = new Button(this);
         btnOpenRun.setText("3. RUN NCORE FILE");
 
+        Button btnRunBrowser = new Button(this);
+        btnRunBrowser.setText("4. RUN IN BROWSER");
+
         controlsLayout.addView(btnImportHtml);
         controlsLayout.addView(btnCompileSave);
         controlsLayout.addView(btnOpenRun);
+        controlsLayout.addView(btnRunBrowser);
+        topBarScroll.addView(controlsLayout);
+
+        // Native Scroll View Container
+        nativeScrollView = new ScrollView(this);
+        LinearLayout.LayoutParams scrollParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0, 1.0f);
+        scrollParams.topMargin = 16;
+        nativeScrollView.setLayoutParams(scrollParams);
+        nativeScrollView.setFillViewport(true);
 
         uiContainer = new LinearLayout(this);
         uiContainer.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams canvasParams = new LinearLayout.LayoutParams(
+        uiContainer.setLayoutParams(new ScrollView.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT);
-        canvasParams.topMargin = 32;
-        uiContainer.setLayoutParams(canvasParams);
+                ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        rootLayout.addView(controlsLayout);
-        rootLayout.addView(uiContainer);
+        nativeScrollView.addView(uiContainer);
+
+        // Full Custom Web Browser Engine Container
+        webView = new WebView(this);
+        LinearLayout.LayoutParams webParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0, 1.0f);
+        webParams.topMargin = 16;
+        webView.setLayoutParams(webParams);
+
+        WebSettings webSettings = webView.getSettings();
+        webSettings.setJavaScriptEnabled(true);
+        webSettings.setDomStorageEnabled(true);
+        webSettings.setAllowFileAccess(true);
+        webSettings.setAllowContentAccess(true);
+        webSettings.setAllowFileAccessFromFileURLs(true);
+        webSettings.setAllowUniversalAccessFromFileURLs(true);
+        webSettings.setBuiltInZoomControls(true);
+        webSettings.setDisplayZoomControls(false);
+        webSettings.setUseWideViewPort(true);
+        webSettings.setLoadWithOverviewMode(true);
+        webSettings.setDatabaseEnabled(true);
+
+        webView.setWebViewClient(new WebViewClient());
+        webView.setWebChromeClient(new WebChromeClient());
+
+        rootLayout.addView(topBarScroll);
+        rootLayout.addView(nativeScrollView);
+        rootLayout.addView(webView);
+
+        // Default layout visibility
+        webView.setVisibility(View.GONE);
+
         setContentView(rootLayout);
 
         btnImportHtml.setOnClickListener(v -> {
@@ -518,6 +589,17 @@ public class MainActivity extends AppCompatActivity {
             Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
             intent.setType("*/*");
             openNCoreLauncher.launch(intent);
+        });
+
+        btnRunBrowser.setOnClickListener(v -> {
+            if (importedHtmlBytes == null) {
+                Toast.makeText(this, "Please import an HTML file first!", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            String htmlContent = new String(importedHtmlBytes, StandardCharsets.UTF_8);
+            nativeScrollView.setVisibility(View.GONE);
+            webView.setVisibility(View.VISIBLE);
+            webView.loadDataWithBaseURL("file:///android_asset/", htmlContent, "text/html", "UTF-8", null);
         });
     }
 
@@ -579,4 +661,4 @@ zipStoreBase=GRADLE_USER_HOME
 zipStorePath=wrapper/dists
 """)
 
-print("[✔] NCore Upgraded Native Engine Generated Successfully!")
+print("[✔] NCore Upgraded Native & Web Hybrid Engine Generated Successfully!")
