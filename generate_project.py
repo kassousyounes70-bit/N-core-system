@@ -7,14 +7,7 @@ def create_file(path, content):
     with open(path, "w", encoding="utf-8") as f:
         f.write(content.strip() + "\n")
 
-def create_binary_file(path, data):
-    dirname = os.path.dirname(path)
-    if dirname:
-        os.makedirs(dirname, exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(data)
-
-print("[*] Generating Android NDK Obfuscated Engine Project...")
+print("[*] Generating Android NDK HTML Encryptor & Runner Project...")
 
 # 1. Root Settings & Build Scripts
 create_file("settings.gradle", """
@@ -108,10 +101,12 @@ dependencies {
 }
 """)
 
-# 3. Android Manifest
+# 3. Android Manifest (Added Internet for WebView if needed)
 create_file("app/src/main/AndroidManifest.xml", """
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:allowBackup="true"
@@ -154,93 +149,84 @@ target_link_libraries(
 )
 """)
 
-# 5. Native C++ Core Engine (No HTML Decryption in RAM, Reads Raw Bytecode Directly)
+# 5. Native C++ Core Engine (In-Memory Encryption/Decryption)
 create_file("app/src/main/cpp/native_engine.cpp", r"""
 #include <jni.h>
 #include <string>
-#include <vector>
 #include <android/log.h>
 
 #define LOG_TAG "NCoreNativeEngine"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// Opcodes defined for UI construction
-const uint8_t OP_CONTAINER = 0x01;
-const uint8_t OP_TEXT      = 0x02;
-const uint8_t OP_BUTTON    = 0x03;
+// Custom Encryption Key (Hidden in Compiled C++)
+const char ENCRYPTION_KEY[] = "NCORE_SUPER_SECRET_KEY_2026";
 
-extern "C" JNIEXPORT void JNICALL
-Java_com_ncore_engine_MainActivity_parseAndRenderNativeUI(
-        JNIEnv* env,
-        jobject instance,
-        jbyteArray rawData,
-        jobject rootView) {
-
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_ncore_engine_MainActivity_encryptData(JNIEnv* env, jobject /* this */, jbyteArray rawData) {
     jsize length = env->GetArrayLength(rawData);
     jbyte* buffer = env->GetByteArrayElements(rawData, nullptr);
+    
+    jbyteArray result = env->NewByteArray(length);
+    jbyte* resultBuffer = env->GetByteArrayElements(result, nullptr);
 
-    if (length < 14) {
-        LOGE("Invalid file size");
-        env->ReleaseByteArrayElements(rawData, buffer, JNI_ABORT);
-        return;
-    }
-
-    // Verify Magic Header: NCORE_NATIVE_V1
-    std::string magicHeader(reinterpret_cast<char*>(buffer), 15);
-    if (magicHeader.rfind("NCORE_NATIVE_V1", 0) != 0) {
-        LOGE("Header mismatch! File is corrupted or invalid.");
-        env->ReleaseByteArrayElements(rawData, buffer, JNI_ABORT);
-        return;
-    }
-
-    LOGI("Magic Header Verified. Starting direct JNI bytecode rendering...");
-
-    // Obtain Java classes via reflection
-    jclass mainActivityClass = env->GetObjectClass(instance);
-    jmethodID addTextViewMethod = env->GetMethodID(mainActivityClass, "addNativeTextView", "(Ljava/lang/String;)V");
-    jmethodID addButtonMethod = env->GetMethodID(mainActivityClass, "addNativeButton", "(Ljava/lang/String;)V");
-
-    size_t index = 15; // Skip Magic Header bytes
-
-    while (index < static_cast<size_t>(length)) {
-        uint8_t opcode = static_cast<uint8_t>(buffer[index++]);
-
-        if (opcode == OP_TEXT || opcode == OP_BUTTON) {
-            if (index >= static_cast<size_t>(length)) break;
-            uint8_t strLen = static_cast<uint8_t>(buffer[index++]);
-
-            if (index + strLen > static_cast<size_t>(length)) break;
-            std::string textContent(reinterpret_cast<char*>(buffer + index), strLen);
-            index += strLen;
-
-            jstring jstr = env->NewStringUTF(textContent.c_str());
-
-            if (opcode == OP_TEXT) {
-                env->CallVoidMethod(instance, addTextViewMethod, jstr);
-            } else if (opcode == OP_BUTTON) {
-                env->CallVoidMethod(instance, addButtonMethod, jstr);
-            }
-
-            env->DeleteLocalRef(jstr);
-        }
+    // Simple XOR cipher logic in RAM
+    size_t keyLen = sizeof(ENCRYPTION_KEY) - 1;
+    for (int i = 0; i < length; i++) {
+        resultBuffer[i] = buffer[i] ^ ENCRYPTION_KEY[i % keyLen];
     }
 
     env->ReleaseByteArrayElements(rawData, buffer, JNI_ABORT);
+    env->ReleaseByteArrayElements(result, resultBuffer, 0);
+    
+    LOGI("Data encrypted successfully. Size: %d bytes", length);
+    return result;
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_ncore_engine_MainActivity_decryptData(JNIEnv* env, jobject /* this */, jbyteArray encryptedData) {
+    jsize length = env->GetArrayLength(encryptedData);
+    jbyte* buffer = env->GetByteArrayElements(encryptedData, nullptr);
+    
+    jbyteArray result = env->NewByteArray(length);
+    jbyte* resultBuffer = env->GetByteArrayElements(result, nullptr);
+
+    // XOR decryption (same as encryption)
+    size_t keyLen = sizeof(ENCRYPTION_KEY) - 1;
+    for (int i = 0; i < length; i++) {
+        resultBuffer[i] = buffer[i] ^ ENCRYPTION_KEY[i % keyLen];
+    }
+
+    env->ReleaseByteArrayElements(encryptedData, buffer, JNI_ABORT);
+    env->ReleaseByteArrayElements(result, resultBuffer, 0);
+    
+    LOGI("Data decrypted successfully in RAM. Size: %d bytes", length);
+    return result;
 }
 """)
 
-# 6. Android MainActivity Host (Bridge to Native UI)
+# 6. Android MainActivity Host (UI, File Picker, WebView, JNI Bridge)
 create_file("app/src/main/java/com/ncore/engine/MainActivity.java", """
 package com.ncore.engine;
 
+import android.content.Intent;
+import android.net.Uri;
 import android.os.Bundle;
+import android.util.Base64;
+import android.view.ViewGroup;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
 import android.widget.Button;
 import android.widget.LinearLayout;
-import android.widget.TextView;
 import android.widget.Toast;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -248,65 +234,154 @@ public class MainActivity extends AppCompatActivity {
         System.loadLibrary("ncore_engine");
     }
 
-    private LinearLayout rootLayout;
+    // Native Methods
+    public native byte[] encryptData(byte[] rawData);
+    public native byte[] decryptData(byte[] encryptedData);
 
-    public native void parseAndRenderNativeUI(byte[] rawData, LinearLayout rootView);
+    private byte[] selectedFileBytes = null;
+    private byte[] currentEncryptedBytes = null;
+    private WebView webView;
+
+    // File Picker for Raw HTML
+    private final ActivityResultLauncher<Intent> htmlPickerLauncher = registerForActivityResult(
+            new ActivityResultContracts.StartActivityForResult(),
+            result -> {
+                if (result.getResultCode() == RESULT_OK && result.getData() != null) {
+                    Uri uri = result.getData().getData();
+                    try {
+                        InputStream is = getContentResolver().openInputStream(uri);
+                        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                        int nRead;
+                        byte[] data = new byte[16384];
+                        while ((nRead = is.read(data, 0, data.length)) != -1) {
+                            buffer.write(data, 0, nRead);
+                        }
+                        selectedFileBytes = buffer.toByteArray();
+                        is.close();
+                        Toast.makeText(this, "HTML Loaded! Ready to encrypt.", Toast.LENGTH_SHORT).show();
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                        Toast.makeText(this, "Failed to read file.", Toast.LENGTH_SHORT).show();
+                    }
+                }
+            }
+    );
+
+    // File Picker for Encrypted File
+    private final ActivityResultLauncher<Intent> encryptedPickerLauncher = registerForActivityResult(
+            new ActivityResultContracts.StartActivityForResult(),
+            result -> {
+                if (result.getResultCode() == RESULT_OK && result.getData() != null) {
+                    Uri uri = result.getData().getData();
+                    try {
+                        InputStream is = getContentResolver().openInputStream(uri);
+                        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                        int nRead;
+                        byte[] data = new byte[16384];
+                        while ((nRead = is.read(data, 0, data.length)) != -1) {
+                            buffer.write(data, 0, nRead);
+                        }
+                        currentEncryptedBytes = buffer.toByteArray();
+                        is.close();
+                        
+                        // Decrypt in RAM instantly and load to WebView
+                        byte[] decryptedBytes = decryptData(currentEncryptedBytes);
+                        String htmlContent = new String(decryptedBytes, StandardCharsets.UTF_8);
+                        
+                        // Load into WebView without saving to disk
+                        webView.loadDataWithBaseURL(null, htmlContent, "text/html", "UTF-8", null);
+                        Toast.makeText(this, "Decrypted & Running in RAM!", Toast.LENGTH_SHORT).show();
+                        
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                        Toast.makeText(this, "Failed to read encrypted file.", Toast.LENGTH_SHORT).show();
+                    }
+                }
+            }
+    );
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        rootLayout = new LinearLayout(this);
+        // UI Setup
+        LinearLayout rootLayout = new LinearLayout(this);
         rootLayout.setOrientation(LinearLayout.VERTICAL);
-        rootLayout.setPadding(48, 48, 48, 48);
+        rootLayout.setPadding(32, 32, 32, 32);
 
+        // Control Panel
+        LinearLayout controlsLayout = new LinearLayout(this);
+        controlsLayout.setOrientation(LinearLayout.HORIZONTAL);
+        
+        Button btnSelectHtml = new Button(this);
+        btnSelectHtml.setText("Load HTML");
+        
+        Button btnEncrypt = new Button(this);
+        btnEncrypt.setText("Encrypt & Save");
+        
+        Button btnRun = new Button(this);
+        btnRun.setText("Run Encrypted");
+
+        controlsLayout.addView(btnSelectHtml);
+        controlsLayout.addView(btnEncrypt);
+        controlsLayout.addView(btnRun);
+
+        // WebView Setup
+        webView = new WebView(this);
+        WebSettings webSettings = webView.getSettings();
+        webSettings.setJavaScriptEnabled(true);
+        webSettings.setDomStorageEnabled(true);
+        
+        LinearLayout.LayoutParams webParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 
+                ViewGroup.LayoutParams.MATCH_PARENT);
+        webParams.topMargin = 32;
+        webView.setLayoutParams(webParams);
+
+        rootLayout.addView(controlsLayout);
+        rootLayout.addView(webView);
         setContentView(rootLayout);
 
-        try {
-            InputStream is = getAssets().open("index.html");
-            byte[] rawBytes = new byte[is.available()];
-            is.read(rawBytes);
-            is.close();
+        // Button Listeners
+        btnSelectHtml.setOnClickListener(v -> {
+            Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+            intent.setType("*/*");
+            htmlPickerLauncher.launch(intent);
+        });
 
-            // Pass raw bytes straight to C++ engine
-            parseAndRenderNativeUI(rawBytes, rootLayout);
+        btnEncrypt.setOnClickListener(v -> {
+            if (selectedFileBytes == null) {
+                Toast.makeText(this, "Load an HTML file first!", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            
+            // Send to Native C++ for Encryption
+            currentEncryptedBytes = encryptData(selectedFileBytes);
+            
+            // Save Encrypted file to device
+            try {
+                File dir = getExternalFilesDir(null);
+                File outFile = new File(dir, "encrypted_ncore.bin");
+                FileOutputStream fos = new FileOutputStream(outFile);
+                fos.write(currentEncryptedBytes);
+                fos.close();
+                Toast.makeText(this, "Saved: " + outFile.getAbsolutePath(), Toast.LENGTH_LONG).show();
+            } catch (Exception e) {
+                e.printStackTrace();
+                Toast.makeText(this, "Save Failed!", Toast.LENGTH_SHORT).show();
+            }
+        });
 
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
-
-    // Called from C++ JNI directly
-    public void addNativeTextView(String text) {
-        TextView textView = new TextView(this);
-        textView.setText(text);
-        textView.setTextSize(20f);
-        textView.setPadding(0, 16, 0, 16);
-        rootLayout.addView(textView);
-    }
-
-    // Called from C++ JNI directly
-    public void addNativeButton(String text) {
-        Button button = new Button(this);
-        button.setText(text);
-        button.setOnClickListener(v -> 
-            Toast.makeText(MainActivity.this, "Engine Action Triggered!", Toast.LENGTH_SHORT).show()
-        );
-        rootLayout.addView(button);
+        btnRun.setOnClickListener(v -> {
+            Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+            intent.setType("*/*");
+            encryptedPickerLauncher.launch(intent);
+        });
     }
 }
 """)
 
-# 7. Disguised Obfuscated Binary Asset (`index.html`)
-# Header: "NCORE_NATIVE_V1" + Bytecodes for UI Elements
-html_disguise_bytes = (
-    b"NCORE_NATIVE_V1" +
-    b"\x02\x15NCore Engine Online!" +  # OP_TEXT (Len 21)
-    b"\x03\x0CExecute Code"           # OP_BUTTON (Len 12)
-)
-create_binary_file("app/src/main/assets/index.html", html_disguise_bytes)
-
-# 8. Gradle Wrapper Properties
+# 7. Gradle Wrapper Properties
 create_file("gradle/wrapper/gradle-wrapper.properties", """
 distributionBase=GRADLE_USER_HOME
 distributionPath=wrapper/dists
@@ -315,4 +390,4 @@ zipStoreBase=GRADLE_USER_HOME
 zipStorePath=wrapper/dists
 """)
 
-print("[✔] Project successfully scaffolded!")
+print("[✔] Full File Picker, Encryption Engine, and Runner UI Scaffolding Complete!")
