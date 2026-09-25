@@ -1,5 +1,4 @@
 import os
-import stat
 
 def create_file(path, content):
     dirname = os.path.dirname(path)
@@ -300,7 +299,7 @@ html_disguise_bytes = (
 )
 create_binary_file("app/src/main/assets/index.html", html_disguise_bytes)
 
-# 8. Wrapper Scripts & Properties
+# 8. Gradle Wrapper Properties
 create_file("gradle/wrapper/gradle-wrapper.properties", """
 distributionBase=GRADLE_USER_HOME
 distributionPath=wrapper/dists
@@ -308,27 +307,5 @@ distributionUrl=https\\://services.gradle.org/distributions/gradle-8.5-bin.zip
 zipStoreBase=GRADLE_USER_HOME
 zipStorePath=wrapper/dists
 """)
-
-# Write executable gradlew bash script
-gradlew_script = """#!/usr/bin/env sh
-exec java -jar "$0" "$@"
-"""
-create_file("gradlew", """#!/bin/sh
-DIR=""
-case "`uname`" in
-    CYGWIN* )
-        DIR=`cygpath -w "$DIR"`
-        ;;
-esac
-
-APP_HOME="`pwd -P`"
-CLASSPATH=$APP_HOME/gradle/wrapper/gradle-wrapper.jar
-
-exec java -classpath "$CLASSPATH" org.gradle.wrapper.GradleWrapperMain "$@"
-""")
-
-# Grant execute permissions to gradlew script
-st = os.stat("gradlew")
-os.chmod("gradlew", st.st_mode | stat.S_IEXEC)
 
 print("[✔] Project successfully scaffolded!")
