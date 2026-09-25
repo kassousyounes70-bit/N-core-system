@@ -1,0 +1,41 @@
+name: Build Obfuscated Native Engine APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Generate Complete Android NDK Project Structure
+        run: python generate_project.py
+
+      - name: Make Gradle Executable
+        run: chmod +x gradlew
+
+      - name: Build Debug APK via Gradle
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload Generated APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NCore-Native-Engine-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          
