@@ -26,12 +26,14 @@ jobs:
 
       - name: Setup Gradle Environment
         uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
 
       - name: Generate Complete Android NDK Project Structure
         run: python generate_project.py
 
       - name: Build Debug APK via Gradle
-        run: gradle assembleDebug -Pandroid.useAndroidX=true -Pandroid.enableJetifier=true --stacktrace
+        run: gradle assembleDebug --stacktrace
 
       - name: Upload Generated APK
         uses: actions/upload-artifact@v4
