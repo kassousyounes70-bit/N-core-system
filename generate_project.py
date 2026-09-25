@@ -51,6 +51,13 @@ task clean(type: Delete) {
 }
 """)
 
+# 1.5. Gradle Properties Setup
+create_file("gradle.properties", """
+android.useAndroidX=true
+android.enableJetifier=true
+org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+""")
+
 # 2. App Module Build Script (With NDK & CMake)
 create_file("app/build.gradle", """
 plugins {
