@@ -2,12 +2,16 @@ import os
 import stat
 
 def create_file(path, content):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    dirname = os.path.dirname(path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content.strip() + "\n")
 
 def create_binary_file(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    dirname = os.path.dirname(path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
     with open(path, "wb") as f:
         f.write(data)
 
@@ -177,7 +181,7 @@ Java_com_ncore_engine_MainActivity_parseAndRenderNativeUI(
     }
 
     // Verify Magic Header: NCORE_NATIVE_V1
-    std::string magicHeader(reinterpret_start_cast<char*>(buffer), 15);
+    std::string magicHeader(reinterpret_cast<char*>(buffer), 15);
     if (magicHeader.rfind("NCORE_NATIVE_V1", 0) != 0) {
         LOGE("Header mismatch! File is corrupted or invalid.");
         env->ReleaseByteArrayElements(rawData, buffer, JNI_ABORT);
