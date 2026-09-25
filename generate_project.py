@@ -7,7 +7,7 @@ def create_file(path, content):
     with open(path, "w", encoding="utf-8") as f:
         f.write(content.strip() + "\n")
 
-print("[*] Generating Android NDK Custom Native Engine (No WebView)...")
+print("[*] Generating Upgraded NCore Custom Native Rendering Engine...")
 
 # 1. Root Settings & Build Scripts
 create_file("settings.gradle", """
@@ -64,7 +64,7 @@ android {
         minSdk 21
         targetSdk 34
         versionCode 1
-        versionName "1.0"
+        versionName "2.0"
 
         externalNativeBuild {
             cmake {
@@ -101,7 +101,7 @@ dependencies {
 
 create_file("app/src/main/AndroidManifest.xml", """
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/manifest/android">
     <application
         android:allowBackup="true"
         android:icon="@android:drawable/sym_def_app_icon"
@@ -141,36 +141,60 @@ target_link_libraries(
 )
 """)
 
-# 5. Native C++ Core Engine (HTML Compiler & Bytecode Interpreter)
+# 5. Native C++ Core Engine (Advanced Parser & Bytecode Interpreter)
 create_file("app/src/main/cpp/native_engine.cpp", r"""
 #include <jni.h>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <android/log.h>
 
 #define LOG_TAG "NCoreNativeEngine"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// NCore Custom Language Opcodes
 const uint8_t OP_TEXT = 0x01;
 const uint8_t OP_BUTTON = 0x02;
-const char MAGIC_HEADER[] = "NCORE_V1";
+const char MAGIC_HEADER[] = "NCORE_V2";
 
-// Helper function to extract text between tags
-std::string extractTagContent(const std::string& html, const std::string& startTag, const std::string& endTag, size_t& searchPos) {
-    size_t start = html.find(startTag, searchPos);
-    if (start == std::string::npos) return "";
-    
-    start += startTag.length();
-    size_t end = html.find(endTag, start);
-    if (end == std::string::npos) return "";
-    
-    searchPos = end + endTag.length();
-    return html.substr(start, end - start);
+struct RenderNode {
+    uint8_t opcode;
+    bool isBold;
+    uint32_t textColor; // ARGB
+    uint32_t bgColor;   // ARGB
+    uint8_t fontSize;
+    std::string text;
+};
+
+// Helper to remove nested HTML tags and extract raw clean text
+std::string cleanHtmlTags(const std::string& input, bool& outIsBold) {
+    std::string result = "";
+    outIsBold = false;
+    bool inTag = false;
+    std::string currentTag = "";
+
+    for (size_t i = 0; i < input.length(); ++i) {
+        char c = input[i];
+        if (c == '<') {
+            inTag = true;
+            currentTag = "";
+        } else if (c == '>') {
+            inTag = false;
+            std::transform(currentTag.begin(), currentTag.end(), currentTag.begin(), ::tolower);
+            if (currentTag == "strong" || currentTag == "b") {
+                outIsBold = true;
+            }
+        } else {
+            if (inTag) {
+                currentTag += c;
+            } else {
+                result += c;
+            }
+        }
+    }
+    return result;
 }
 
-// 1. COMPILER: Translates standard HTML tags into NCore Custom Bytecode (Gibberish)
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_ncore_engine_MainActivity_compileHtmlToNCore(JNIEnv* env, jobject /* this */, jbyteArray htmlData) {
     jsize length = env->GetArrayLength(htmlData);
@@ -180,107 +204,173 @@ Java_com_ncore_engine_MainActivity_compileHtmlToNCore(JNIEnv* env, jobject /* th
 
     std::vector<uint8_t> outBuffer;
     
-    // Add Magic Header
+    // Add Magic Header NCORE_V2
     for (char c : MAGIC_HEADER) {
         if (c != '\0') outBuffer.push_back(c);
     }
 
-    size_t searchPos = 0;
-    
-    // Very simple parser for demonstration: extracts <p> and <button>
-    // Converts them into native binary opcodes
-    while (searchPos < htmlContent.length()) {
-        size_t nextP = htmlContent.find("<p>", searchPos);
-        size_t nextBtn = htmlContent.find("<button>", searchPos);
-        
-        if (nextP == std::string::npos && nextBtn == std::string::npos) break;
+    std::vector<RenderNode> nodes;
+    size_t pos = 0;
 
-        if (nextP != std::string::npos && (nextBtn == std::string::npos || nextP < nextBtn)) {
-            std::string content = extractTagContent(htmlContent, "<p>", "</p>", searchPos);
-            if (!content.empty()) {
-                outBuffer.push_back(OP_TEXT);
-                outBuffer.push_back(static_cast<uint8_t>(content.length()));
-                outBuffer.insert(outBuffer.end(), content.begin(), content.end());
+    while (pos < htmlContent.length()) {
+        size_t tagOpen = htmlContent.find('<', pos);
+        if (tagOpen == std::string::npos) break;
+
+        size_t tagClose = htmlContent.find('>', tagOpen);
+        if (tagClose == std::string::npos) break;
+
+        std::string tagName = htmlContent.substr(tagOpen + 1, tagClose - tagOpen - 1);
+        std::transform(tagName.begin(), tagName.end(), tagName.begin(), ::tolower);
+
+        // Process paragraph / text block
+        if (tagName == "p" || tagName.rfind("p ", 0) == 0 || tagName == "div" || tagName.rfind("div ", 0) == 0) {
+            size_t endBlock = htmlContent.find("</", tagClose);
+            if (endBlock != std::string::npos) {
+                std::string rawText = htmlContent.substr(tagClose + 1, endBlock - tagClose - 1);
+                bool isBold = false;
+                std::string cleanText = cleanHtmlTags(rawText, isBold);
+
+                if (!cleanText.empty()) {
+                    RenderNode node;
+                    node.opcode = OP_TEXT;
+                    node.isBold = isBold;
+                    node.textColor = 0xFF212121; // Dark Gray Default
+                    node.bgColor = 0x00000000;   // Transparent
+                    node.fontSize = 16;
+                    node.text = cleanText;
+                    nodes.push_back(node);
+                }
+                pos = endBlock;
             }
-        } else if (nextBtn != std::string::npos) {
-            std::string content = extractTagContent(htmlContent, "<button>", "</button>", searchPos);
-            if (!content.empty()) {
-                outBuffer.push_back(OP_BUTTON);
-                outBuffer.push_back(static_cast<uint8_t>(content.length()));
-                outBuffer.insert(outBuffer.end(), content.begin(), content.end());
+        } 
+        // Process button element
+        else if (tagName == "button" || tagName.rfind("button ", 0) == 0) {
+            size_t endBlock = htmlContent.find("</button>", tagClose);
+            if (endBlock != std::string::npos) {
+                std::string rawText = htmlContent.substr(tagClose + 1, endBlock - tagClose - 1);
+                bool isBold = false;
+                std::string cleanText = cleanHtmlTags(rawText, isBold);
+
+                if (!cleanText.empty()) {
+                    RenderNode node;
+                    node.opcode = OP_BUTTON;
+                    node.isBold = true;
+                    node.textColor = 0xFFFFFFFF; // White Text
+                    node.bgColor = 0xFF1E88E5;   // Material Blue
+                    node.fontSize = 14;
+                    node.text = cleanText;
+                    nodes.push_back(node);
+                }
+                pos = endBlock;
             }
         }
+        pos = tagClose + 1;
+    }
+
+    // Binary Serialization Protocol
+    for (const auto& node : nodes) {
+        outBuffer.push_back(node.opcode);
+        outBuffer.push_back(node.isBold ? 0x01 : 0x00);
+        
+        // Write Text Color (4 bytes)
+        outBuffer.push_back((node.textColor >> 24) & 0xFF);
+        outBuffer.push_back((node.textColor >> 16) & 0xFF);
+        outBuffer.push_back((node.textColor >> 8) & 0xFF);
+        outBuffer.push_back(node.textColor & 0xFF);
+
+        // Write BG Color (4 bytes)
+        outBuffer.push_back((node.bgColor >> 24) & 0xFF);
+        outBuffer.push_back((node.bgColor >> 16) & 0xFF);
+        outBuffer.push_back((node.bgColor >> 8) & 0xFF);
+        outBuffer.push_back(node.bgColor & 0xFF);
+
+        outBuffer.push_back(node.fontSize);
+
+        // Text Length (2 bytes)
+        uint16_t textLen = static_cast<uint16_t>(node.text.length());
+        outBuffer.push_back((textLen >> 8) & 0xFF);
+        outBuffer.push_back(textLen & 0xFF);
+
+        outBuffer.insert(outBuffer.end(), node.text.begin(), node.text.end());
     }
 
     jbyteArray result = env->NewByteArray(outBuffer.size());
     env->SetByteArrayRegion(result, 0, outBuffer.size(), reinterpret_cast<const jbyte*>(outBuffer.data()));
     
-    LOGI("HTML compiled to NCore Bytecode successfully. Size: %zu bytes", outBuffer.size());
+    LOGI("HTML Compiled into NCore Protocol. Generated %zu nodes.", nodes.size());
     return result;
 }
 
-// 2. INTERPRETER: Reads the NCore Bytecode and builds Native UI directly
 extern "C" JNIEXPORT void JNICALL
 Java_com_ncore_engine_MainActivity_executeNCoreBytecode(JNIEnv* env, jobject instance, jbyteArray bytecodeData) {
     jsize length = env->GetArrayLength(bytecodeData);
     jbyte* buffer = env->GetByteArrayElements(bytecodeData, nullptr);
 
     if (length < 8) {
-        LOGE("Invalid NCore file size");
         env->ReleaseByteArrayElements(bytecodeData, buffer, JNI_ABORT);
         return;
     }
 
     std::string header(reinterpret_cast<char*>(buffer), 8);
     if (header != MAGIC_HEADER) {
-        LOGE("Invalid NCore Magic Header!");
+        LOGE("Invalid Header! File is corrupt or untrusted.");
         env->ReleaseByteArrayElements(bytecodeData, buffer, JNI_ABORT);
         return;
     }
 
-    // Get Java methods to draw native UI
     jclass mainActivityClass = env->GetObjectClass(instance);
-    jmethodID addTextMethod = env->GetMethodID(mainActivityClass, "addNativeText", "(Ljava/lang/String;)V");
-    jmethodID addButtonMethod = env->GetMethodID(mainActivityClass, "addNativeButton", "(Ljava/lang/String;)V");
+    jmethodID addTextMethod = env->GetMethodID(mainActivityClass, "addNativeText", "(Ljava/lang/String;ZIII)V");
+    jmethodID addButtonMethod = env->GetMethodID(mainActivityClass, "addNativeButton", "(Ljava/lang/String;II)V");
 
-    size_t index = 8; // Skip header
+    size_t index = 8; // Skip Magic Header
 
-    // Read opcodes and execute
     while (index < static_cast<size_t>(length)) {
         uint8_t opcode = static_cast<uint8_t>(buffer[index++]);
+        bool isBold = static_cast<uint8_t>(buffer[index++]) == 0x01;
 
-        if (opcode == OP_TEXT || opcode == OP_BUTTON) {
-            if (index >= static_cast<size_t>(length)) break;
-            
-            uint8_t strLen = static_cast<uint8_t>(buffer[index++]);
-            
-            if (index + strLen > static_cast<size_t>(length)) break;
-            
-            std::string content(reinterpret_cast<char*>(buffer + index), strLen);
-            index += strLen;
+        uint32_t textColor = (static_cast<uint8_t>(buffer[index]) << 24) |
+                             (static_cast<uint8_t>(buffer[index + 1]) << 16) |
+                             (static_cast<uint8_t>(buffer[index + 2]) << 8) |
+                             static_cast<uint8_t>(buffer[index + 3]);
+        index += 4;
 
-            jstring jContent = env->NewStringUTF(content.c_str());
+        uint32_t bgColor = (static_cast<uint8_t>(buffer[index]) << 24) |
+                           (static_cast<uint8_t>(buffer[index + 1]) << 16) |
+                           (static_cast<uint8_t>(buffer[index + 2]) << 8) |
+                           static_cast<uint8_t>(buffer[index + 3]);
+        index += 4;
 
-            if (opcode == OP_TEXT) {
-                env->CallVoidMethod(instance, addTextMethod, jContent);
-            } else if (opcode == OP_BUTTON) {
-                env->CallVoidMethod(instance, addButtonMethod, jContent);
-            }
+        uint8_t fontSize = static_cast<uint8_t>(buffer[index++]);
 
-            env->DeleteLocalRef(jContent);
+        uint16_t strLen = (static_cast<uint8_t>(buffer[index]) << 8) | static_cast<uint8_t>(buffer[index + 1]);
+        index += 2;
+
+        std::string content(reinterpret_cast<char*>(buffer + index), strLen);
+        index += strLen;
+
+        jstring jContent = env->NewStringUTF(content.c_str());
+
+        if (opcode == OP_TEXT) {
+            env->CallVoidMethod(instance, addTextMethod, jContent, isBold, (jint)textColor, (jint)bgColor, (jint)fontSize);
+        } else if (opcode == OP_BUTTON) {
+            env->CallVoidMethod(instance, addButtonMethod, jContent, (jint)textColor, (jint)bgColor);
         }
+
+        env->DeleteLocalRef(jContent);
     }
 
     env->ReleaseByteArrayElements(bytecodeData, buffer, JNI_ABORT);
-    LOGI("NCore Bytecode executed and rendered natively.");
 }
 """)
 
-# 6. Android MainActivity Host (UI, File Picker, Native JNI Bridge)
+# 6. Android MainActivity Host (UI, Native Dynamic Styling Bridge)
 create_file("app/src/main/java/com/ncore/engine/MainActivity.java", """
 package com.ncore.engine;
 
 import android.content.Intent;
+import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.view.ViewGroup;
@@ -302,14 +392,12 @@ public class MainActivity extends AppCompatActivity {
         System.loadLibrary("ncore_engine");
     }
 
-    // Native Engine Methods
     public native byte[] compileHtmlToNCore(byte[] htmlData);
     public native void executeNCoreBytecode(byte[] bytecodeData);
 
     private byte[] importedHtmlBytes = null;
     private LinearLayout uiContainer;
 
-    // 1. Picker: Import raw HTML file
     private final ActivityResultLauncher<Intent> selectHtmlLauncher = registerForActivityResult(
             new ActivityResultContracts.StartActivityForResult(),
             result -> {
@@ -323,7 +411,7 @@ public class MainActivity extends AppCompatActivity {
                             buffer.write(data, 0, nRead);
                         }
                         importedHtmlBytes = buffer.toByteArray();
-                        Toast.makeText(this, "HTML Imported! Tap 'Compile to NCore'.", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(this, "HTML Imported successfully!", Toast.LENGTH_SHORT).show();
                     } catch (Exception e) {
                         e.printStackTrace();
                     }
@@ -331,7 +419,6 @@ public class MainActivity extends AppCompatActivity {
             }
     );
 
-    // 2. Saver: Export the Custom NCore Bytecode (The Gibberish File)
     private final ActivityResultLauncher<Intent> saveNCoreLauncher = registerForActivityResult(
             new ActivityResultContracts.StartActivityForResult(),
             result -> {
@@ -339,10 +426,9 @@ public class MainActivity extends AppCompatActivity {
                     Uri uri = result.getData().getData();
                     try (OutputStream os = getContentResolver().openOutputStream(uri)) {
                         if (importedHtmlBytes != null && os != null) {
-                            // Compile HTML to our custom language format
                             byte[] ncoreBytecode = compileHtmlToNCore(importedHtmlBytes);
                             os.write(ncoreBytecode);
-                            Toast.makeText(this, "Compiled file saved successfully!", Toast.LENGTH_LONG).show();
+                            Toast.makeText(this, "NCore File Compiled & Saved!", Toast.LENGTH_LONG).show();
                         }
                     } catch (Exception e) {
                         e.printStackTrace();
@@ -351,7 +437,6 @@ public class MainActivity extends AppCompatActivity {
             }
     );
 
-    // 3. Picker: Select a compiled .ncore file to execute natively
     private final ActivityResultLauncher<Intent> openNCoreLauncher = registerForActivityResult(
             new ActivityResultContracts.StartActivityForResult(),
             result -> {
@@ -365,13 +450,9 @@ public class MainActivity extends AppCompatActivity {
                             buffer.write(data, 0, nRead);
                         }
                         
-                        // Clear the UI canvas before rendering new file
                         uiContainer.removeAllViews();
-                        
-                        // Send the Gibberish bytecode directly to C++ interpreter
                         executeNCoreBytecode(buffer.toByteArray());
-                        
-                        Toast.makeText(this, "Executing NCore Engine...", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(this, "Rendered with NCore Native Engine!", Toast.LENGTH_SHORT).show();
                     } catch (Exception e) {
                         e.printStackTrace();
                     }
@@ -385,25 +466,24 @@ public class MainActivity extends AppCompatActivity {
 
         LinearLayout rootLayout = new LinearLayout(this);
         rootLayout.setOrientation(LinearLayout.VERTICAL);
-        rootLayout.setPadding(24, 24, 24, 24);
+        rootLayout.setPadding(32, 32, 32, 32);
 
         LinearLayout controlsLayout = new LinearLayout(this);
         controlsLayout.setOrientation(LinearLayout.HORIZONTAL);
 
         Button btnImportHtml = new Button(this);
-        btnImportHtml.setText("1. Import HTML");
+        btnImportHtml.setText("1. IMPORT HTML");
 
         Button btnCompileSave = new Button(this);
-        btnCompileSave.setText("2. Compile to NCore");
+        btnCompileSave.setText("2. COMPILE TO NCORE");
 
         Button btnOpenRun = new Button(this);
-        btnOpenRun.setText("3. Run NCore File");
+        btnOpenRun.setText("3. RUN NCORE FILE");
 
         controlsLayout.addView(btnImportHtml);
         controlsLayout.addView(btnCompileSave);
         controlsLayout.addView(btnOpenRun);
 
-        // This is the blank canvas where C++ will draw the UI directly
         uiContainer = new LinearLayout(this);
         uiContainer.setOrientation(LinearLayout.VERTICAL);
         LinearLayout.LayoutParams canvasParams = new LinearLayout.LayoutParams(
@@ -416,14 +496,12 @@ public class MainActivity extends AppCompatActivity {
         rootLayout.addView(uiContainer);
         setContentView(rootLayout);
 
-        // Action 1
         btnImportHtml.setOnClickListener(v -> {
             Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
             intent.setType("*/*");
             selectHtmlLauncher.launch(intent);
         });
 
-        // Action 2
         btnCompileSave.setOnClickListener(v -> {
             if (importedHtmlBytes == null) {
                 Toast.makeText(this, "Please import an HTML file first!", Toast.LENGTH_SHORT).show();
@@ -436,7 +514,6 @@ public class MainActivity extends AppCompatActivity {
             saveNCoreLauncher.launch(intent);
         });
 
-        // Action 3
         btnOpenRun.setOnClickListener(v -> {
             Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
             intent.setType("*/*");
@@ -444,23 +521,51 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    // --- Native Callbacks (Called directly from C++ JNI) ---
-    // The engine reads the bytecode and executes these methods.
-    
-    public void addNativeText(String text) {
+    // --- Dynamic Native Callbacks Invoked by C++ Engine ---
+
+    public void addNativeText(String text, boolean isBold, int textColor, int bgColor, int fontSize) {
         TextView textView = new TextView(this);
         textView.setText(text);
-        textView.setTextSize(18f);
-        textView.setPadding(0, 16, 0, 16);
+        textView.setTextSize((float) fontSize);
+        textView.setTextColor(textColor);
+
+        if (isBold) {
+            textView.setTypeface(null, Typeface.BOLD);
+        }
+
+        if (bgColor != 0) {
+            textView.setBackgroundColor(bgColor);
+        }
+
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.setMargins(0, 8, 0, 8);
+        textView.setLayoutParams(params);
+
         uiContainer.addView(textView);
     }
 
-    public void addNativeButton(String text) {
+    public void addNativeButton(String text, int textColor, int bgColor) {
         Button button = new Button(this);
         button.setText(text);
+        button.setTextColor(textColor);
+        button.setTypeface(null, Typeface.BOLD);
+
+        // Render Native Shape with rounded corners
+        GradientDrawable shape = new GradientDrawable();
+        shape.setCornerRadius(24f);
+        shape.setColor(bgColor);
+        button.setBackground(shape);
+
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.setMargins(0, 16, 0, 16);
+        button.setLayoutParams(params);
+
         button.setOnClickListener(v -> 
-            Toast.makeText(this, "Native Button Clicked: " + text, Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Native Action Executed: " + text, Toast.LENGTH_SHORT).show()
         );
+
         uiContainer.addView(button);
     }
 }
@@ -474,4 +579,4 @@ zipStoreBase=GRADLE_USER_HOME
 zipStorePath=wrapper/dists
 """)
 
-print("[✔] NCore Native Engine Scaffolded Successfully!")
+print("[✔] NCore Upgraded Native Engine Generated Successfully!")
