@@ -31,7 +31,7 @@ jobs:
         run: python generate_project.py
 
       - name: Build Debug APK via Gradle
-        run: gradle assembleDebug --stacktrace
+        run: gradle assembleDebug -Pandroid.useAndroidX=true -Pandroid.enableJetifier=true --stacktrace
 
       - name: Upload Generated APK
         uses: actions/upload-artifact@v4
