@@ -1,4 +1,4 @@
-name: Build Obfuscated Native Engine APK
+name: Build NCore Native Engine APK
 
 on:
   push:
@@ -24,19 +24,41 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Setup Gradle Environment
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      # Pin the NDK explicitly. Never rely on whatever the runner happens to ship.
+      - name: Install pinned NDK and CMake
+        run: sdkmanager --install "ndk;26.3.11579264" "cmake;3.22.1"
+
+      - name: Export NDK environment
+        run: echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
+
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.5'
 
-      - name: Generate Complete Android NDK Project Structure
+      - name: Generate Android NDK Project Structure
+        env:
+          # Optional: set this repo secret so the app and encoder share a stable key.
+          NCORE_MASTER_KEY: ${{ secrets.NCORE_MASTER_KEY }}
         run: python generate_project.py
 
-      - name: Build Debug APK via Gradle
-        run: gradle assembleDebug --stacktrace
+      # Materialise the wrapper so `./gradlew` is real and reproducible.
+      - name: Generate Gradle wrapper
+        run: gradle wrapper --gradle-version 8.5
 
-      - name: Upload Generated APK
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Build Release APK (minified + native)
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
           name: NCore-Native-Engine-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/release/app-release.apk
