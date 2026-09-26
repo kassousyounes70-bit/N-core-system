@@ -105,7 +105,7 @@ android {
 
         externalNativeBuild {
             cmake {
-                cppFlags "-std=c++17 -fvisibility=hidden -fstack-protector-strong -D_FORTIFY_SOURCE=2"
+                cppFlags "-std=c++17 -fvisibility=hidden -fstack-protector-strong"
                 arguments "-DANDROID_STL=c++_shared"
             }
         }
@@ -234,6 +234,11 @@ target_compile_options(ncore_engine PRIVATE
 )
 
 target_link_options(ncore_engine PRIVATE -Wl,--gc-sections)
+
+# _FORTIFY_SOURCE needs optimization; enable it only for release builds.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_compile_definitions(ncore_engine PRIVATE _FORTIFY_SOURCE=2)
+endif()
 """)
 
 # ===========================================================================
