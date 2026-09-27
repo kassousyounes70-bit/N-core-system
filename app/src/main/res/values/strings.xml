@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">HTML Protector</string>
+    <string name="status_idle">Import an HTML file (optional JS/CSS), then encrypt and export.</string>
+    <string name="btn_import">Import</string>
+    <string name="btn_export">Encrypt &amp; Export</string>
+    <string name="btn_open">Open Encrypted</string>
+</resources>
