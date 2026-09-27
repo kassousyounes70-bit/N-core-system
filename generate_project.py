@@ -1548,6 +1548,7 @@ import random
 import re
 import struct
 import sys
+import importlib.util
 from html.parser import HTMLParser
 
 MAGIC = b'NCB3'
@@ -1702,6 +1703,79 @@ def hkdf_sha256(ikm, salt, info, length):
 
 
 # ---------------------------------------------------------------------------
+# Add-on pipeline
+# ---------------------------------------------------------------------------
+# Add-ons are optional offline transforms. They run BEFORE HTML is converted
+# into NCore instructions. An add-on module must expose transform(source_text,
+# context) and return the transformed source as a string.
+# ---------------------------------------------------------------------------
+
+def load_addons(addon_dir):
+    addons = []
+    if not addon_dir or not os.path.isdir(addon_dir):
+        return addons
+    for name in sorted(os.listdir(addon_dir)):
+        if not name.endswith('.py') or name.startswith('_'):
+            continue
+        path = os.path.join(addon_dir, name)
+        try:
+            spec = importlib.util.spec_from_file_location(
+                'ncore_addon_' + re.sub(r'[^A-Za-z0-9_]', '_', name), path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            transform = getattr(module, 'transform', None)
+            if callable(transform):
+                addons.append((name, transform))
+            else:
+                print('[!] add-on %s ignored: missing transform()' % name,
+                      file=sys.stderr)
+        except Exception as exc:
+            print('[!] add-on %s failed to load: %s' % (name, exc),
+                  file=sys.stderr)
+    return addons
+
+
+def apply_addons(source_text, source_dir, input_path, addon_dir):
+    context = {
+        'source_dir': source_dir,
+        'input_path': input_path,
+        'addon_dir': addon_dir,
+    }
+    current = source_text
+    for name, transform in load_addons(addon_dir):
+        try:
+            result = transform(current, context)
+            if result is None:
+                raise ValueError('transform() returned None')
+            if not isinstance(result, str):
+                raise TypeError('transform() must return str')
+            current = result
+            print('[+] add-on applied: %s' % name)
+        except Exception as exc:
+            raise SystemExit('add-on %s failed: %s' % (name, exc))
+    return current
+
+
+def load_external_stylesheets(builder, source_dir):
+    if not source_dir:
+        return
+    for href in builder.stylesheet_links:
+        if not href or href.startswith(('http://', 'https://', 'data:')):
+            continue
+        candidate = os.path.abspath(os.path.join(source_dir, href))
+        if not os.path.isfile(candidate):
+            print('[!] external stylesheet not found: %s' % href,
+                  file=sys.stderr)
+            continue
+        try:
+            with open(candidate, 'r', encoding='utf-8', errors='replace') as f:
+                builder.style_blocks.append(f.read())
+        except OSError as exc:
+            print('[!] cannot read stylesheet %s: %s' % (href, exc),
+                  file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # DOM
 # ---------------------------------------------------------------------------
 
@@ -1718,11 +1792,16 @@ class DomBuilder(HTMLParser):
         self.root = Node('#root', {})
         self.stack = [self.root]
         self.style_blocks = []
+        self.stylesheet_links = []
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
         node = Node(tag, {k.lower(): (v or '') for k, v in attrs})
         self.stack[-1].children.append(node)
+        if tag == 'link' and node.attrs.get('rel', '').lower() == 'stylesheet':
+            href = node.attrs.get('href', '').strip()
+            if href:
+                self.stylesheet_links.append(href)
         if tag not in VOID_TAGS:
             self.stack.append(node)
 
@@ -2189,11 +2268,15 @@ def collect_codepoints(node, acc):
             collect_codepoints(child, acc)
 
 
-def encode(html_bytes, master_key, out_path):
+def encode(html_bytes, master_key, out_path, source_dir=None, input_path=None, addon_dir=None):
+    global CSS_RULES
+    CSS_RULES = []
     text = html_bytes.decode('utf-8', 'replace')
+    text = apply_addons(text, source_dir, input_path, addon_dir)
     builder = DomBuilder()
     builder.feed(text)
     builder.close()
+    load_external_stylesheets(builder, source_dir)
     compile_css('\n'.join(builder.style_blocks))
 
     file_id = os.urandom(8)
@@ -2215,7 +2298,7 @@ def encode(html_bytes, master_key, out_path):
     for i, real in enumerate(op_map):
         enc_of[real] = i
 
-    base_dir = os.path.dirname(os.path.abspath(out_path)) if out_path else None
+    base_dir = source_dir
     em = Emitter(alphabet, enc_of, base_dir)
     emit_children(em, builder.root, dict(DEFAULT_ST), None)
     enc_end = bytes([enc_of[OP_END]])
@@ -2343,6 +2426,8 @@ def main():
     parser.add_argument('--key-file', default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'master.key'))
     parser.add_argument('--key', default=None, help='64 hex chars (overrides key file)')
+    parser.add_argument('--addon-dir', default=None,
+                        help='directory containing offline add-ons (*.py)')
     parser.add_argument('--dump', metavar='NCORE', help='decode a .ncore for QA')
     args = parser.parse_args()
 
@@ -2358,7 +2443,12 @@ def main():
 
     with open(args.input, 'rb') as handle:
         html_bytes = handle.read()
-    plain_len, cipher_len = encode(html_bytes, key, args.output)
+    source_path = os.path.abspath(args.input)
+    source_dir = os.path.dirname(source_path)
+    addon_dir = (os.path.abspath(args.addon_dir) if args.addon_dir
+                 else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'addons'))
+    plain_len, cipher_len = encode(
+        html_bytes, key, args.output, source_dir, source_path, addon_dir)
     print('wrote %s (%d plaintext bytes, %d ciphertext bytes)' % (
         args.output, plain_len, cipher_len))
     return 0
@@ -2367,6 +2457,21 @@ def main():
 if __name__ == '__main__':
     sys.exit(main())
 ''')
+
+create_file("encoder/addons/README.md", """
+# NCore offline add-ons
+
+An add-on is a compiler-side Python transform. It runs before HTML is
+converted into NCore bytecode and does not run inside the Android app.
+
+Required API:
+
+    def transform(source_text, context):
+        return source_text
+
+`context` contains `source_dir`, `input_path`, and `addon_dir`.
+The encoder loads `*.py` files in this directory in alphabetical order.
+""")
 
 create_file("encoder/master.key", KEY_HEX)
 
