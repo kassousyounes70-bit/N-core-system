@@ -1128,6 +1128,35 @@ private:
 
 }  // namespace
 
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_ncore_engine_MainActivity_nativeEncryptNCore(JNIEnv* env, jclass, jbyteArray plainArray,
+                                                       jbyteArray fileIdArray) {
+    if (!plainArray || !fileIdArray || env->GetArrayLength(fileIdArray) != 8) return nullptr;
+    jsize pn = env->GetArrayLength(plainArray);
+    if (pn <= 0) return nullptr;
+    std::vector<uint8_t> plain((size_t)pn);
+    env->GetByteArrayRegion(plainArray, 0, pn, reinterpret_cast<jbyte*>(plain.data()));
+    uint8_t fileId[8];
+    env->GetByteArrayRegion(fileIdArray, 0, 8, reinterpret_cast<jbyte*>(fileId));
+    static const uint8_t INFO_BODY[] = "ncore3/body";
+    static const uint8_t INFO_MAC[] = "ncore3/mac";
+    uint8_t bodyKey[32], macKey[32];
+    ncore::crypto::hkdf_sha256(NCORE_MASTER_KEY, 32, fileId, 8, INFO_BODY, sizeof(INFO_BODY)-1, bodyKey, 32);
+    ncore::crypto::hkdf_sha256(NCORE_MASTER_KEY, 32, fileId, 8, INFO_MAC, sizeof(INFO_MAC)-1, macKey, 32);
+    uint8_t nonce[12]; std::memcpy(nonce, fileId, 8); std::memset(nonce+8, 0, 4);
+    std::vector<uint8_t> cipher(plain.size());
+    ncore::crypto::chacha20_xor(bodyKey, nonce, 0, plain.data(), plain.size(), cipher.data());
+    std::vector<uint8_t> header(48, 0);
+    header[0]='N'; header[1]='C'; header[2]='B'; header[3]='3'; header[4]=3; header[5]=0; header[6]=48; header[7]=0;
+    std::memcpy(header.data()+8, fileId, 8);
+    uint64_t blen=cipher.size(); for(int i=0;i<8;i++) header[16+i]=(uint8_t)(blen>>(8*i));
+    std::vector<uint8_t> macInput; macInput.reserve(header.size()+cipher.size()); macInput.insert(macInput.end(),header.begin(),header.end()); macInput.insert(macInput.end(),cipher.begin(),cipher.end());
+    uint8_t tag[32]; ncore::crypto::hmac_sha256(macKey,32,macInput.data(),macInput.size(),tag);
+    std::vector<uint8_t> out; out.reserve(48+cipher.size()+32); out.insert(out.end(),header.begin(),header.end()); out.insert(out.end(),cipher.begin(),cipher.end()); out.insert(out.end(),tag,tag+32);
+    secure_zero(bodyKey,32); secure_zero(macKey,32); secure_zero(tag,32);
+    jbyteArray ret=env->NewByteArray((jsize)out.size()); if(!ret)return nullptr; env->SetByteArrayRegion(ret,0,(jsize)out.size(),reinterpret_cast<const jbyte*>(out.data())); return ret;
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_ncore_engine_MainActivity_nativeRunNCore(JNIEnv* env, jobject thiz,
                                                   jbyteArray data) {
@@ -1164,6 +1193,189 @@ Java_com_ncore_engine_MainActivity_nativeRunNCore(JNIEnv* env, jobject thiz,
 # Android host: renders the streamed instructions as native views.
 # There is no WebView and no HTML string on this path.
 # ===========================================================================
+
+create_file("app/src/main/java/com/ncore/engine/NCoreMobileEncoder.java", r"""
+package com.ncore.engine;
+
+import android.net.Uri;
+import android.content.ContentResolver;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * On-device HTML -> NCore encoder.
+ *
+ * This is deliberately a small compiler for the NCore v3 instruction set. It
+ * accepts an HTML document plus optional external CSS/JS files. CSS is folded
+ * into the supported NCore style model. JavaScript is passed through the
+ * Add-on pipeline; unsupported JS is not silently executed.
+ */
+public final class NCoreMobileEncoder {
+    private NCoreMobileEncoder() {}
+
+    public interface Addon {
+        String name();
+        String transform(String html, Map<String,String> files);
+    }
+
+    private static final List<Addon> ADDONS = new ArrayList<>();
+    static {
+        ADDONS.add(new BasicScriptAddon());
+    }
+    public static void registerAddon(Addon addon) { if (addon != null) ADDONS.add(addon); }
+
+    private static final class BasicScriptAddon implements Addon {
+        public String name() { return "basic-script-guard"; }
+        public String transform(String html, Map<String,String> files) {
+            // The current NCore runtime has no JS VM. Keep script blocks out of
+            // the render stream instead of pretending that arbitrary JS works.
+            return html.replaceAll("(?is)<script\\b[^>]*>.*?</script\\s*>", "");
+        }
+    }
+
+    private static String read(ContentResolver cr, Uri uri) throws Exception {
+        try (InputStream in = cr.openInputStream(uri); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            if (in == null) throw new Exception("Cannot open " + uri);
+            byte[] b = new byte[16384]; int n;
+            while ((n = in.read(b)) >= 0) { if (n > 0) out.write(b, 0, n); }
+            return out.toString(StandardCharsets.UTF_8.name());
+        }
+    }
+
+    public static byte[] compile(ContentResolver cr, List<Uri> uris) throws Exception {
+        if (uris == null || uris.isEmpty()) throw new Exception("No files selected");
+        Map<String,String> files = new LinkedHashMap<>();
+        String html = null;
+        for (Uri u : uris) {
+            String name = guessName(u);
+            String data = read(cr, u);
+            files.put(name, data);
+            if (name.toLowerCase(Locale.US).endsWith(".html") || name.toLowerCase(Locale.US).endsWith(".htm")) {
+                if (html == null) html = data;
+            }
+        }
+        if (html == null) throw new Exception("Select at least one .html file");
+
+        // Fold selected external CSS files into <style> blocks.
+        StringBuilder css = new StringBuilder();
+        Matcher lm = Pattern.compile("(?is)<link\\b([^>]*?)>").matcher(html);
+        while (lm.find()) {
+            String attrs = lm.group(1);
+            String rel = attr(attrs, "rel");
+            String href = attr(attrs, "href");
+            if (rel != null && rel.toLowerCase(Locale.US).contains("stylesheet") && href != null) {
+                String cssText = findFile(files, href);
+                if (cssText != null) css.append(cssText).append('\n');
+            }
+        }
+        Matcher sm = Pattern.compile("(?is)<style\\b[^>]*>(.*?)</style\\s*>").matcher(html);
+        while (sm.find()) css.append(sm.group(1)).append('\n');
+        html = "<style>" + css + "</style>" + html;
+
+        for (Addon a : ADDONS) html = a.transform(html, files);
+        html = html.replaceAll("(?is)<style\\b[^>]*>.*?</style\\s*>", "");
+        html = html.replaceAll("(?is)<script\\b[^>]*>.*?</script\\s*>", "");
+        return compileToNCore(html, css.toString());
+    }
+
+    private static String guessName(Uri u) {
+        String p = u.getPath();
+        if (p != null) {
+            int i = p.lastIndexOf('/');
+            if (i >= 0 && i + 1 < p.length()) return p.substring(i + 1);
+        }
+        String s = u.toString(); int i = s.lastIndexOf('/');
+        return i >= 0 ? s.substring(i + 1) : "file";
+    }
+    private static String attr(String a, String key) {
+        Matcher m = Pattern.compile("(?i)(?:^|\\s)" + Pattern.quote(key) + "\\s*=\\s*([\\\"'])(.*?)\\1").matcher(a);
+        if (m.find()) return m.group(2);
+        m = Pattern.compile("(?i)(?:^|\\s)" + Pattern.quote(key) + "\\s*=\\s*([^\\s>]+)").matcher(a);
+        return m.find() ? m.group(1) : null;
+    }
+    private static String findFile(Map<String,String> files, String href) {
+        String h = href.trim().replace('\\','/');
+        int q = h.indexOf('?'); if (q >= 0) h = h.substring(0,q);
+        int i = h.lastIndexOf('/'); String base = i >= 0 ? h.substring(i+1) : h;
+        for (Map.Entry<String,String> e : files.entrySet()) {
+            String k=e.getKey().replace('\\','/');
+            if (k.equals(h) || k.endsWith('/'+base) || k.equals(base)) return e.getValue();
+        }
+        return null;
+    }
+
+    private static final class Node {
+        String tag; Map<String,String> attrs = new HashMap<>(); List<Object> children = new ArrayList<>();
+        Node parent; Node(String t, Node p){tag=t;parent=p;}
+    }
+    private static final Set<String> VOID = new HashSet<>(Arrays.asList("br","hr","img","meta","link","input"));
+    private static final Set<String> BLOCK = new HashSet<>(Arrays.asList("div","p","h1","h2","h3","h4","h5","h6","blockquote","pre","ul","ol","li","table","tr","td","th","section","header","footer","main","nav","aside","article","button"));
+
+    private static Node parse(String html) {
+        Node root=new Node("root",null), cur=root;
+        Pattern p=Pattern.compile("(?is)<!--.*?-->|<![^>]*>|<[^>]+>|[^<]+");
+        Matcher m=p.matcher(html);
+        while(m.find()){
+            String x=m.group();
+            if(x.startsWith("<!--")||x.startsWith("<!")) continue;
+            if(x.startsWith("<")){
+                if(x.startsWith("</")){ String t=x.replaceAll("(?is)</\\s*([a-z0-9]+).*","$1").toLowerCase(Locale.US); Node n=cur; while(n!=root&&!n.tag.equals(t))n=n.parent; if(n!=root&&n.parent!=null)cur=n.parent; continue; }
+                String t=x.replaceAll("(?is)<\\s*([a-z0-9]+).*","$1").toLowerCase(Locale.US);
+                Node n=new Node(t,cur); Matcher am=Pattern.compile("(?i)([a-z_:][-a-z0-9_:.]*)\\s*=\\s*([\\\"'])(.*?)\\2|([a-z_:][-a-z0-9_:.]*)\\s*=\\s*([^\\s>]+)").matcher(x);
+                while(am.find()) { String k=am.group(1)!=null?am.group(1):am.group(4); String v=am.group(1)!=null?am.group(3):am.group(5); n.attrs.put(k.toLowerCase(Locale.US),v); }
+                cur.children.add(n); if(!VOID.contains(t)&&!x.endsWith("/>")&&!t.equals("script")&&!t.equals("style"))cur=n;
+            } else cur.children.add(unescape(x));
+        }
+        return root;
+    }
+    private static String unescape(String s){ return s.replace("&nbsp;"," ").replace("&amp;","&").replace("&lt;","<").replace("&gt;",">").replace("&quot;","\"").replace("&#39;","'"); }
+
+    private static final class Style { int fg=0xFF212121,bg=0,size=16; boolean bold,italic,under,strike; int align=0,mt,mb,pad,corner,bw,bc=0xFFE0E0E0; }
+    private static Map<String,Style> css(String text){
+        Map<String,Style> out=new LinkedHashMap<>(); Matcher m=Pattern.compile("(?is)([^{}]+)\\{([^}]*)}").matcher(text);
+        while(m.find()){ String sel=m.group(1).trim(); Style s=new Style(); String body=m.group(2); Matcher d=Pattern.compile("(?is)([a-z-]+)\\s*:\\s*([^;]+)").matcher(body);
+            while(d.find()){String k=d.group(1).trim().toLowerCase(Locale.US),v=d.group(2).trim(); apply(s,k,v);} for(String q:sel.split(","))out.put(q.trim(),s); }
+        return out;
+    }
+    private static void apply(Style s,String k,String v){
+        try{ if(k.equals("color"))s.fg=color(v,s.fg); else if(k.equals("background-color")||k.equals("background"))s.bg=color(v,s.bg); else if(k.equals("font-size"))s.size=Math.max(8,Math.min(96,px(v,s.size))); else if(k.equals("font-weight"))s.bold=v.equalsIgnoreCase("bold")||Integer.parseInt(v)>=600; else if(k.equals("font-style"))s.italic=v.toLowerCase(Locale.US).contains("italic"); else if(k.equals("text-decoration")){s.under=v.contains("underline");s.strike=v.contains("line-through");} else if(k.equals("text-align")){if(v.equals("center"))s.align=1;else if(v.equals("right"))s.align=2;else if(v.equals("justify"))s.align=3;else s.align=0;} else if(k.equals("margin-top"))s.mt=px(v,0); else if(k.equals("margin-bottom"))s.mb=px(v,0); else if(k.equals("padding"))s.pad=px(v,0); else if(k.equals("border-radius"))s.corner=px(v,0); else if(k.equals("border-width"))s.bw=px(v,0); else if(k.equals("border-color"))s.bc=color(v,s.bc);}catch(Exception ignored){}
+    }
+    private static int px(String v,int d){Matcher m=Pattern.compile("-?[0-9]+(?:\\.[0-9]+)?").matcher(v);return m.find()?Math.max(0,Math.min(4095,(int)Float.parseFloat(m.group()))):d;}
+    private static int color(String v,int d){v=v.trim().toLowerCase(Locale.US);try{if(v.startsWith("#")){String h=v.substring(1);if(h.length()==3)h=""+h.charAt(0)+h.charAt(0)+h.charAt(1)+h.charAt(1)+h.charAt(2)+h.charAt(2);if(h.length()==6)return 0xFF000000|(int)Long.parseLong(h,16);if(h.length()==8)return (int)Long.parseLong(h,16);} if(v.equals("red"))return 0xFFFF0000;if(v.equals("green"))return 0xFF008000;if(v.equals("blue"))return 0xFF0000FF;if(v.equals("black"))return 0xFF000000;if(v.equals("white"))return 0xFFFFFFFF;}catch(Exception ignored){}return d;}
+
+    private static byte[] compileToNCore(String html,String cssText) throws Exception {
+        Node root=parse(html); Map<String,Style> rules=css(cssText); ArrayList<Style> styles=new ArrayList<>(); Map<String,Integer> ids=new HashMap<>(); ByteArrayOutputStream ops=new ByteArrayOutputStream();
+        Set<Integer> cps=new TreeSet<>(); cps.add((int)' '); cps.add((int)'\n');
+        SecureRandom sr=new SecureRandom(); byte[] fileId=new byte[8];sr.nextBytes(fileId);
+        Random rnd=new Random(Arrays.hashCode(fileId)^0x9E3779B9L); byte[] opMap=new byte[256];List<Integer> perm=new ArrayList<>();for(int i=0;i<256;i++)perm.add(i);Collections.shuffle(perm,rnd);for(int i=0;i<256;i++)opMap[i]=(byte)(int)perm.get(i); int[] enc=new int[256];for(int i=0;i<256;i++)enc[perm.get(i)]=i;
+        emit(root,ops,styles,ids,rules,cps); byte[] end={(byte)enc[0]};ops.write(end);
+        ArrayList<Integer> alphabet=new ArrayList<>(cps);Collections.shuffle(alphabet,rnd);Map<Integer,Integer> gi=new HashMap<>();for(int i=0;i<alphabet.size();i++)gi.put(alphabet.get(i),i);
+        byte[] rawOps=ops.toByteArray(); ByteArrayOutputStream body=new ByteArrayOutputStream();
+        body.write(1); body.write(opMap); body.write(alphabet.size()&255); body.write((alphabet.size()>>8)&255);
+        for(int cp:alphabet){body.write(cp&255);body.write((cp>>8)&255);body.write((cp>>16)&255);body.write((cp>>24)&255);}
+        byte[] op=convertTextMarkers(rawOps,gi,enc); body.write(op);
+        return MainActivity.nativeEncryptNCore(body.toByteArray(),fileId);
+    }
+
+    private static void emit(Node root,ByteArrayOutputStream out,ArrayList<Style> styles,Map<String,Integer> ids,Map<String,Style> rules,Set<Integer> cps){
+        for(Object o:root.children){if(o instanceof String){emitText((String)o,out,styles,ids,rules,cps,null);continue;}Node n=(Node)o;String t=n.tag;if(t.equals("style")||t.equals("script"))continue;if(t.equals("br")){writeSpacer(out,16);continue;}Style s=styleFor(n,rules);int sid=styleId(s,styles);if(BLOCK.contains(t)){writeStyle(out,sid,s);writeBlock(out,t,sid);emit(n,out,styles,ids,rules,cps);writeClose(out);}else{emit(n,out,styles,ids,rules,cps);}}
+    }
+    private static void emitText(String txt,ByteArrayOutputStream out,ArrayList<Style> styles,Map<String,Integer> ids,Map<String,Style> rules,Set<Integer> cps,Style parent){txt=txt.replaceAll("\\s+"," ");if(txt.trim().isEmpty())return;for(int i=0;i<txt.length();i++)cps.add((int)txt.charAt(i));int sid=styleId(parent==null?new Style():parent,styles);ByteArrayOutputStream b=new ByteArrayOutputStream();b.write(0x04);w16(b,sid);w16(b,0);w16(b,0);w32(b,txt.length());for(int i=0;i<txt.length();i++)w16(b,txt.charAt(i));try{out.write(b.toByteArray());}catch(Exception ignored){}}
+    private static Style styleFor(Node n,Map<String,Style> r){Style s=new Style();String tag=n.tag;Style d=r.get(tag);if(d!=null)s=d;String c=n.attrs.get("class");if(c!=null&&r.get("."+c.split("\\s+")[0])!=null)s=r.get("."+c.split("\\s+")[0]);String id=n.attrs.get("id");if(id!=null&&r.get("#"+id)!=null)s=r.get("#"+id);if(tag.equals("h1")){s.bold=true;s.size=32;}else if(tag.equals("h2")){s.bold=true;s.size=26;}else if(tag.equals("h3")){s.bold=true;s.size=22;}return s;}
+    private static int styleId(Style s,ArrayList<Style> a){for(int i=0;i<a.size();i++)if(eq(a.get(i),s))return i;a.add(s);return a.size()-1;}
+    private static boolean eq(Style a,Style b){return a.fg==b.fg&&a.bg==b.bg&&a.size==b.size&&a.bold==b.bold&&a.italic==b.italic&&a.under==b.under&&a.strike==b.strike&&a.align==b.align&&a.mt==b.mt&&a.mb==b.mb&&a.pad==b.pad&&a.corner==b.corner&&a.bw==b.bw&&a.bc==b.bc;}
+    private static void writeStyle(ByteArrayOutputStream o,int id,Style s){o.write(1);w16(o,id);w32(o,s.fg);w32(o,s.bg);w16(o,s.size);o.write(s.bold?1:0);o.write(s.italic?1:0);o.write(s.under?1:0);o.write(s.strike?1:0);o.write(s.align);w16(o,s.mt);w16(o,s.mb);w16(o,s.pad);w16(o,s.corner);w16(o,s.bw);w32(o,s.bc);}
+    private static void writeBlock(ByteArrayOutputStream o,String t,int sid){o.write(2);w16(o,kind(t));w16(o,sid);w16(o,0);} private static void writeClose(ByteArrayOutputStream o){o.write(3);} private static void writeSpacer(ByteArrayOutputStream o,int h){o.write(6);w16(o,h);} private static int kind(String t){String[] a={"div","p","h1","h2","h3","h4","h5","h6","blockquote","pre","ul","ol","li","table","tr","td","th","section","header","footer","main","nav","aside","article","button"};for(int i=0;i<a.length;i++)if(a[i].equals(t))return i+1;return 0;}
+    private static byte[] stylesToBytes(ArrayList<Style> a){ByteArrayOutputStream o=new ByteArrayOutputStream();for(int i=0;i<a.size();i++)writeStyle(o,i,a.get(i));return o.toByteArray();}
+    private static byte[] convertTextMarkers(byte[] raw,Map<Integer,Integer> gi,int[] enc){ByteArrayOutputStream o=new ByteArrayOutputStream();for(int i=0;i<raw.length;){int op=raw[i++]&255;o.write(enc[op]);if(op==4){int sid=u16(raw,i);i+=2;w16(o,sid);int flags=u16(raw,i);i+=2;w16(o,flags);int ul=u16(raw,i);i+=2;w16(o,ul);i+=ul;int n=(int)u32(raw,i);i+=4;w32(o,n);for(int j=0;j<n;j++){int cp=u16(raw,i);i+=2;w16(o,gi.getOrDefault(cp,0));}}else{int len=op==1?29:op==2?6:op==3?0:op==6?2:0;if(len>0){o.write(raw,i,len);i+=len;}}}return o.toByteArray();}
+    private static long u32(byte[]b,int p){return (b[p]&255L)|((b[p+1]&255L)<<8)|((b[p+2]&255L)<<16)|((b[p+3]&255L)<<24);}private static int u16(byte[]b,int p){return (b[p]&255)|((b[p+1]&255)<<8);}private static void w16(ByteArrayOutputStream o,int v){o.write(v&255);o.write((v>>8)&255);}private static void w32(ByteArrayOutputStream o,int v){o.write(v&255);o.write((v>>8)&255);o.write((v>>16)&255);o.write((v>>24)&255);}
+}
+""")
 
 create_file("app/src/main/java/com/ncore/engine/MainActivity.java", """
 package com.ncore.engine;
@@ -1206,6 +1418,7 @@ public class MainActivity extends AppCompatActivity {
 
     // Native entry point: streams the encrypted bytecode and drives the callbacks.
     public native int nativeRunNCore(byte[] data);
+    public static native byte[] nativeEncryptNCore(byte[] plaintext, byte[] fileId);
 
     private static final int EK_HR = 27;
     private static final int ALIGN_LEFT = 0;
@@ -1235,23 +1448,52 @@ public class MainActivity extends AppCompatActivity {
     private LinearLayout uiContainer;
     private boolean hrOpened = false;
 
+    private byte[] pendingNCore;
+
     private final ActivityResultLauncher<Intent> openNCoreLauncher = registerForActivityResult(
-            new ActivityResultContracts.StartActivityForResult(),
-            result -> {
+            new ActivityResultContracts.StartActivityForResult(), result -> {
                 if (result.getResultCode() == RESULT_OK && result.getData() != null) {
                     Uri uri = result.getData().getData();
                     try (InputStream is = getContentResolver().openInputStream(uri);
                          ByteArrayOutputStream buffer = new ByteArrayOutputStream()) {
-                        byte[] chunk = new byte[16384];
-                        int nRead;
-                        while ((nRead = is.read(chunk, 0, chunk.length)) != -1) {
-                            buffer.write(chunk, 0, nRead);
-                        }
+                        byte[] chunk = new byte[16384]; int nRead;
+                        while ((nRead = is.read(chunk)) != -1) if (nRead > 0) buffer.write(chunk, 0, nRead);
                         renderNCore(buffer.toByteArray());
                     } catch (Exception e) {
-                        Toast.makeText(this, "Read error: " + e.getMessage(),
-                                Toast.LENGTH_LONG).show();
+                        Toast.makeText(this, "Read error: " + e.getMessage(), Toast.LENGTH_LONG).show();
                     }
+                }
+            });
+
+    private final ActivityResultLauncher<Intent> importHtmlLauncher = registerForActivityResult(
+            new ActivityResultContracts.StartActivityForResult(), result -> {
+                if (result.getResultCode() != RESULT_OK || result.getData() == null) return;
+                try {
+                    ArrayList<Uri> files = new ArrayList<>();
+                    Uri first = result.getData().getData(); if (first != null) files.add(first);
+                    if (result.getData().getClipData() != null) {
+                        files.clear();
+                        for (int i = 0; i < result.getData().getClipData().getItemCount(); i++) files.add(result.getData().getClipData().getItemAt(i).getUri());
+                    }
+                    pendingNCore = NCoreMobileEncoder.compile(getContentResolver(), files);
+                    Intent save = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                    save.addCategory(Intent.CATEGORY_OPENABLE); save.setType("application/octet-stream");
+                    save.putExtra(Intent.EXTRA_TITLE, "page.ncore"); saveNCoreLauncher.launch(save);
+                } catch (Exception e) {
+                    Toast.makeText(this, "HTML encode error: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                }
+            });
+
+    private final ActivityResultLauncher<Intent> saveNCoreLauncher = registerForActivityResult(
+            new ActivityResultContracts.StartActivityForResult(), result -> {
+                if (result.getResultCode() == RESULT_OK && result.getData() != null && pendingNCore != null) {
+                    try (java.io.OutputStream out = getContentResolver().openOutputStream(result.getData().getData())) {
+                        if (out == null) throw new Exception("Cannot open destination");
+                        out.write(pendingNCore); out.flush();
+                        Toast.makeText(this, "NCore file saved", Toast.LENGTH_LONG).show();
+                    } catch (Exception e) {
+                        Toast.makeText(this, "Save error: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                    } finally { pendingNCore = null; }
                 }
             });
 
@@ -1262,6 +1504,15 @@ public class MainActivity extends AppCompatActivity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(dp(12), dp(12), dp(12), dp(12));
+
+        Button btnImport = new Button(this);
+        btnImport.setText("IMPORT HTML");
+        btnImport.setOnClickListener(v -> {
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE); intent.setType("text/*");
+            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+            importHtmlLauncher.launch(intent);
+        });
 
         Button btnOpen = new Button(this);
         btnOpen.setText("OPEN .NCORE FILE");
@@ -1281,6 +1532,7 @@ public class MainActivity extends AppCompatActivity {
 
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.addView(btnImport);
         bar.addView(btnOpen);
         bar.addView(btnClear);
 
@@ -1548,7 +1800,6 @@ import random
 import re
 import struct
 import sys
-import importlib.util
 from html.parser import HTMLParser
 
 MAGIC = b'NCB3'
@@ -1703,79 +1954,6 @@ def hkdf_sha256(ikm, salt, info, length):
 
 
 # ---------------------------------------------------------------------------
-# Add-on pipeline
-# ---------------------------------------------------------------------------
-# Add-ons are optional offline transforms. They run BEFORE HTML is converted
-# into NCore instructions. An add-on module must expose transform(source_text,
-# context) and return the transformed source as a string.
-# ---------------------------------------------------------------------------
-
-def load_addons(addon_dir):
-    addons = []
-    if not addon_dir or not os.path.isdir(addon_dir):
-        return addons
-    for name in sorted(os.listdir(addon_dir)):
-        if not name.endswith('.py') or name.startswith('_'):
-            continue
-        path = os.path.join(addon_dir, name)
-        try:
-            spec = importlib.util.spec_from_file_location(
-                'ncore_addon_' + re.sub(r'[^A-Za-z0-9_]', '_', name), path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            transform = getattr(module, 'transform', None)
-            if callable(transform):
-                addons.append((name, transform))
-            else:
-                print('[!] add-on %s ignored: missing transform()' % name,
-                      file=sys.stderr)
-        except Exception as exc:
-            print('[!] add-on %s failed to load: %s' % (name, exc),
-                  file=sys.stderr)
-    return addons
-
-
-def apply_addons(source_text, source_dir, input_path, addon_dir):
-    context = {
-        'source_dir': source_dir,
-        'input_path': input_path,
-        'addon_dir': addon_dir,
-    }
-    current = source_text
-    for name, transform in load_addons(addon_dir):
-        try:
-            result = transform(current, context)
-            if result is None:
-                raise ValueError('transform() returned None')
-            if not isinstance(result, str):
-                raise TypeError('transform() must return str')
-            current = result
-            print('[+] add-on applied: %s' % name)
-        except Exception as exc:
-            raise SystemExit('add-on %s failed: %s' % (name, exc))
-    return current
-
-
-def load_external_stylesheets(builder, source_dir):
-    if not source_dir:
-        return
-    for href in builder.stylesheet_links:
-        if not href or href.startswith(('http://', 'https://', 'data:')):
-            continue
-        candidate = os.path.abspath(os.path.join(source_dir, href))
-        if not os.path.isfile(candidate):
-            print('[!] external stylesheet not found: %s' % href,
-                  file=sys.stderr)
-            continue
-        try:
-            with open(candidate, 'r', encoding='utf-8', errors='replace') as f:
-                builder.style_blocks.append(f.read())
-        except OSError as exc:
-            print('[!] cannot read stylesheet %s: %s' % (href, exc),
-                  file=sys.stderr)
-
-
-# ---------------------------------------------------------------------------
 # DOM
 # ---------------------------------------------------------------------------
 
@@ -1792,16 +1970,11 @@ class DomBuilder(HTMLParser):
         self.root = Node('#root', {})
         self.stack = [self.root]
         self.style_blocks = []
-        self.stylesheet_links = []
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
         node = Node(tag, {k.lower(): (v or '') for k, v in attrs})
         self.stack[-1].children.append(node)
-        if tag == 'link' and node.attrs.get('rel', '').lower() == 'stylesheet':
-            href = node.attrs.get('href', '').strip()
-            if href:
-                self.stylesheet_links.append(href)
         if tag not in VOID_TAGS:
             self.stack.append(node)
 
@@ -2268,15 +2441,11 @@ def collect_codepoints(node, acc):
             collect_codepoints(child, acc)
 
 
-def encode(html_bytes, master_key, out_path, source_dir=None, input_path=None, addon_dir=None):
-    global CSS_RULES
-    CSS_RULES = []
+def encode(html_bytes, master_key, out_path):
     text = html_bytes.decode('utf-8', 'replace')
-    text = apply_addons(text, source_dir, input_path, addon_dir)
     builder = DomBuilder()
     builder.feed(text)
     builder.close()
-    load_external_stylesheets(builder, source_dir)
     compile_css('\n'.join(builder.style_blocks))
 
     file_id = os.urandom(8)
@@ -2298,7 +2467,7 @@ def encode(html_bytes, master_key, out_path, source_dir=None, input_path=None, a
     for i, real in enumerate(op_map):
         enc_of[real] = i
 
-    base_dir = source_dir
+    base_dir = os.path.dirname(os.path.abspath(out_path)) if out_path else None
     em = Emitter(alphabet, enc_of, base_dir)
     emit_children(em, builder.root, dict(DEFAULT_ST), None)
     enc_end = bytes([enc_of[OP_END]])
@@ -2426,8 +2595,6 @@ def main():
     parser.add_argument('--key-file', default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'master.key'))
     parser.add_argument('--key', default=None, help='64 hex chars (overrides key file)')
-    parser.add_argument('--addon-dir', default=None,
-                        help='directory containing offline add-ons (*.py)')
     parser.add_argument('--dump', metavar='NCORE', help='decode a .ncore for QA')
     args = parser.parse_args()
 
@@ -2443,12 +2610,7 @@ def main():
 
     with open(args.input, 'rb') as handle:
         html_bytes = handle.read()
-    source_path = os.path.abspath(args.input)
-    source_dir = os.path.dirname(source_path)
-    addon_dir = (os.path.abspath(args.addon_dir) if args.addon_dir
-                 else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'addons'))
-    plain_len, cipher_len = encode(
-        html_bytes, key, args.output, source_dir, source_path, addon_dir)
+    plain_len, cipher_len = encode(html_bytes, key, args.output)
     print('wrote %s (%d plaintext bytes, %d ciphertext bytes)' % (
         args.output, plain_len, cipher_len))
     return 0
@@ -2457,21 +2619,6 @@ def main():
 if __name__ == '__main__':
     sys.exit(main())
 ''')
-
-create_file("encoder/addons/README.md", """
-# NCore offline add-ons
-
-An add-on is a compiler-side Python transform. It runs before HTML is
-converted into NCore bytecode and does not run inside the Android app.
-
-Required API:
-
-    def transform(source_text, context):
-        return source_text
-
-`context` contains `source_dir`, `input_path`, and `addon_dir`.
-The encoder loads `*.py` files in this directory in alphabetical order.
-""")
 
 create_file("encoder/master.key", KEY_HEX)
 
