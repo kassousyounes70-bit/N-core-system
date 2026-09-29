@@ -583,7 +583,7 @@ public class MainActivity extends AppCompatActivity {
     private void handleExport(Uri uri) {
         try {
             byte[] plain = mergedHtml.getBytes(StandardCharsets.UTF_8);
-            byte[] key = KeyVault.getMasterKey(this);
+            byte[] key = NativeCrypto.masterKey();
             if (key == null) {
                 Arrays.fill(plain, (byte) 0);
                 status.setText("Key vault unavailable.");
@@ -628,7 +628,7 @@ public class MainActivity extends AppCompatActivity {
             String text = readText(uri);
             String compact = text.replaceAll("\\s+", "");
             byte[] blob = Base64.decode(compact, Base64.DEFAULT);
-            byte[] key = KeyVault.getMasterKey(this);
+            byte[] key = NativeCrypto.masterKey();
             if (key == null) {
                 status.setText("Key vault unavailable.");
                 toast("Key vault unavailable");
@@ -749,151 +749,13 @@ public final class NativeCrypto {
      * @return the original plaintext, or null when authentication fails
      */
     public static native byte[] decrypt(byte[] blob, byte[] key);
-}
-"""
 
-    java_keyvault = r"""package com.example.protector;
-
-import android.content.Context;
-import android.content.SharedPreferences;
-import android.os.Build;
-import android.security.keystore.KeyGenParameterSpec;
-import android.security.keystore.KeyProperties;
-import android.util.Base64;
-
-import java.security.KeyStore;
-import java.security.SecureRandom;
-
-import javax.crypto.Cipher;
-import javax.crypto.KeyGenerator;
-import javax.crypto.SecretKey;
-import javax.crypto.spec.GCMParameterSpec;
-
-/**
- * Holds the 32-byte master key.
- *
- * The key is never compiled into the APK. On first use a random master key is
- * generated and stored wrapped (AES-256-GCM) by a non-exportable Android
- * Keystore key, backed by the TEE / StrongBox when the device supports it.
- *
- * Consequence: a file encrypted by one installation can only be opened by the
- * same installation. Reinstalling the app creates a new master key.
- */
-public final class KeyVault {
-
-    private static final String ANDROID_KEYSTORE = "AndroidKeyStore";
-    private static final String KEY_ALIAS = "protector.wrap.key.v1";
-    private static final String PREFS = "protector.vault";
-    private static final String PREF_WRAPPED = "wrapped_master_v1";
-    private static final int MASTER_LEN = 32;
-    private static final int GCM_TAG_BITS = 128;
-
-    private KeyVault() {
-    }
-
-    public static synchronized byte[] getMasterKey(Context context) {
-        try {
-            KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE);
-            keyStore.load(null);
-            if (!keyStore.containsAlias(KEY_ALIAS)) {
-                generateWrappingKey();
-            }
-
-            SharedPreferences prefs =
-                    context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-            String stored = prefs.getString(PREF_WRAPPED, null);
-
-            if (stored == null) {
-                byte[] master = new byte[MASTER_LEN];
-                new SecureRandom().nextBytes(master);
-                byte[] wrapped = wrap(master);
-                if (wrapped == null) {
-                    java.util.Arrays.fill(master, (byte) 0);
-                    return null;
-                }
-                prefs.edit()
-                        .putString(PREF_WRAPPED,
-                                Base64.encodeToString(wrapped, Base64.NO_WRAP))
-                        .commit();
-                return master;
-            }
-
-            return unwrap(Base64.decode(stored, Base64.NO_WRAP));
-        } catch (Throwable error) {
-            return null;
-        }
-    }
-
-    private static void generateWrappingKey() throws Exception {
-        KeyGenerator generator =
-                KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE);
-        KeyGenParameterSpec.Builder builder = new KeyGenParameterSpec.Builder(
-                KEY_ALIAS,
-                KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
-                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                .setKeySize(256);
-
-        boolean initialized = false;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            try {
-                builder.setIsStrongBoxBacked(true);
-                generator.init(builder.build());
-                initialized = true;
-            } catch (Throwable strongBoxUnavailable) {
-                builder.setIsStrongBoxBacked(false);
-            }
-        }
-        if (!initialized) {
-            generator.init(builder.build());
-        }
-        generator.generateKey();
-    }
-
-    private static SecretKey loadWrappingKey() throws Exception {
-        KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE);
-        keyStore.load(null);
-        return (SecretKey) keyStore.getKey(KEY_ALIAS, null);
-    }
-
-    private static byte[] wrap(byte[] master) {
-        try {
-            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-            cipher.init(Cipher.ENCRYPT_MODE, loadWrappingKey());
-            byte[] iv = cipher.getIV();
-            byte[] cipherText = cipher.doFinal(master);
-            byte[] out = new byte[1 + iv.length + cipherText.length];
-            out[0] = (byte) iv.length;
-            System.arraycopy(iv, 0, out, 1, iv.length);
-            System.arraycopy(cipherText, 0, out, 1 + iv.length, cipherText.length);
-            return out;
-        } catch (Throwable error) {
-            return null;
-        }
-    }
-
-    private static byte[] unwrap(byte[] wrapped) {
-        try {
-            if (wrapped == null || wrapped.length < 3) {
-                return null;
-            }
-            int ivLength = wrapped[0] & 0xFF;
-            if (ivLength <= 0 || wrapped.length < 1 + ivLength + 1) {
-                return null;
-            }
-            byte[] iv = new byte[ivLength];
-            System.arraycopy(wrapped, 1, iv, 0, ivLength);
-            byte[] cipherText = new byte[wrapped.length - 1 - ivLength];
-            System.arraycopy(wrapped, 1 + ivLength, cipherText, 0, cipherText.length);
-
-            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-            cipher.init(Cipher.DECRYPT_MODE, loadWrappingKey(),
-                    new GCMParameterSpec(GCM_TAG_BITS, iv));
-            return cipher.doFinal(cipherText);
-        } catch (Throwable error) {
-            return null;
-        }
-    }
+    /**
+     * @return the 32-byte application master key, reconstructed inside the
+     * native library. It is identical for every install of this build, so a
+     * protected document can be opened on any device that runs the app.
+     */
+    public static native byte[] masterKey();
 }
 """
 
@@ -1317,6 +1179,33 @@ inline void secure_zero(void* buffer, size_t length) {
     }
 }
 
+// ------------------------------------------------------------------------- //
+// Application master key.
+//
+// Stored XOR-masked so it never appears verbatim in the binary. Every install
+// of the same APK derives the same key, which is what lets a protected document
+// be opened on any device that runs the app - not only on the device that
+// created it. Change the constants below and rebuild to rotate the key; files
+// produced with an older key must then be re-exported.
+// ------------------------------------------------------------------------- //
+const uint8_t kAppMask[kKeyLen] = {
+    0xb4, 0x1c, 0xdd, 0xc6, 0x83, 0x92, 0x54, 0x38, 0x24, 0x1a, 0x6c, 0xc7,
+    0x7d, 0x3a, 0xe3, 0xc8, 0x8f, 0xe3, 0xb2, 0x2f, 0xdd, 0xd3, 0x74, 0xaa,
+    0xfa, 0x00, 0x55, 0x42, 0x1c, 0x8b, 0xce, 0xf6
+};
+const uint8_t kAppData[kKeyLen] = {
+    0x97, 0x30, 0x88, 0xb1, 0x88, 0x3e, 0x38, 0x7b, 0x49, 0xf9, 0x47, 0x50,
+    0x9a, 0x23, 0xb8, 0x44, 0xbb, 0x5f, 0x78, 0x72, 0x36, 0xf2, 0x68, 0x6d,
+    0xf5, 0xf6, 0x1d, 0x69, 0x6b, 0x2f, 0xde, 0x81
+};
+
+inline void load_master_key(uint8_t out[kKeyLen]) {
+    for (size_t i = 0; i < kKeyLen; i++) {
+        uint8_t mix = (uint8_t)(0x5a + (int)(i * 7));
+        out[i] = (uint8_t)(kAppData[i] ^ kAppMask[i] ^ mix);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ChaCha20 (RFC 8439) - 96-bit nonce, 32-bit block counter
 // ---------------------------------------------------------------------------
@@ -1710,6 +1599,18 @@ Java_com_example_protector_NativeCrypto_decrypt(JNIEnv* env, jclass,
     return result;
 }
 
+JNIEXPORT jbyteArray JNICALL
+Java_com_example_protector_NativeCrypto_masterKey(JNIEnv* env, jclass) {
+    uint8_t master[kKeyLen];
+    load_master_key(master);
+    jbyteArray result = env->NewByteArray((jsize)kKeyLen);
+    if (result != nullptr) {
+        env->SetByteArrayRegion(result, 0, (jsize)kKeyLen, (jbyte*)master);
+    }
+    secure_zero(master, sizeof(master));
+    return result;
+}
+
 }  // extern "C"
 #endif
 """
@@ -1829,7 +1730,6 @@ dependencies {
 -keep class com.example.protector.SecureWebView { *; }
 -keep class com.example.protector.SecureWebViewClient { *; }
 -keep class com.example.protector.AndroidBridge { *; }
--keep class com.example.protector.KeyVault { *; }
 -keep class com.example.protector.SecurityGuard { *; }
 
 # Keep any future @JavascriptInterface bridge methods.
@@ -1958,7 +1858,6 @@ if __name__ == "__main__":
         "app/src/main/res/values/themes.xml": themes,
         os.path.join(JAVA_DIR, "MainActivity.java"): java_main,
         os.path.join(JAVA_DIR, "NativeCrypto.java"): java_native,
-        os.path.join(JAVA_DIR, "KeyVault.java"): java_keyvault,
         os.path.join(JAVA_DIR, "SecurityGuard.java"): java_security,
         os.path.join(JAVA_DIR, "SecureWebView.java"): java_securewebview,
         os.path.join(JAVA_DIR, "SecureWebViewClient.java"): java_secureclient,
