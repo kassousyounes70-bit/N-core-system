@@ -46,12 +46,33 @@ jobs:
       - name: Generate Android project
         run: python3 generate_project.py
 
-      - name: Build debug APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+      - name: Fetch bundled vendor libraries and fonts
+        run: python3 tools/fetch_assets.py
+
+      - name: Verify bundled assets
+        run: |
+          test -f app/src/main/assets/vendor/three.min.js
+          test -f app/src/main/assets/vendor/jspdf.umd.min.js
+          test -f app/src/main/assets/vendor/jszip.min.js
+          test -f app/src/main/assets/vendor/potrace.js
+          test -f app/src/main/assets/vendor/mp4-muxer.min.js
+          test -f app/src/main/assets/fonts/fonts.css
+          ls -la app/src/main/assets/vendor
+          ls -la app/src/main/assets/fonts | head
+
+      - name: Build release and debug APKs
+        run: gradle assembleRelease assembleDebug --no-daemon --stacktrace
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: html-protector-release
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
           name: html-protector-debug
           path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
+          if-no-files-found: warn
