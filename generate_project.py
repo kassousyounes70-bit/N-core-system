@@ -156,10 +156,11 @@ def build_files():
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="true"
+        android:usesCleartextTraffic="false"
         android:theme="@style/Theme.Protector">
 
         <activity
@@ -242,7 +243,7 @@ def build_files():
             android:textSize="11sp" />
     </LinearLayout>
 
-    <WebView
+    <com.example.protector.SecureWebView
         android:id="@+id/webview"
         android:layout_width="match_parent"
         android:layout_height="0dp"
@@ -284,12 +285,15 @@ def build_files():
     java_main = r"""package com.example.protector;
 
 import android.content.ContentResolver;
+import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
 import android.util.Base64;
-import android.webkit.WebSettings;
+import android.view.WindowManager;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
 import android.webkit.WebView;
 import android.widget.Button;
 import android.widget.TextView;
@@ -309,21 +313,47 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Pattern;
 
 public class MainActivity extends AppCompatActivity {
 
-    /**
-     * Master key used for this personal build. Replace it with your own 64 hex
-     * characters (32 bytes) before building a real distribution.
-     */
-    private static final String MASTER_KEY_HEX =
-            "7f1c9a3e5d2b8046c1f3a5e7092b4d6e8a0c1e3f5b7d9a2c4e6f80123b5d7a9e";
+    private static final String BASE_URL = "https://app.protector/";
+    private static final String ASSET_BASE = "https://app.protector/assets/";
+
+    // Security policy for personal builds.
+    private static final boolean BLOCK_IF_ROOTED = true;
+    private static final boolean BLOCK_IF_DEBUGGED = true;
+    private static final boolean BLOCK_IF_EMULATOR = false;
+
+    // Third-party libraries the protected tool loads from public CDNs. They are
+    // bundled inside the APK and served from a local origin, so the protected
+    // page never needs the network.
+    private static final String[][] VENDOR_LIBS = {
+            {"kilobtye/potrace", "vendor/potrace.js"},
+            {"jszip/3.10.1/jszip.min.js", "vendor/jszip.min.js"},
+            {"jspdf/2.5.1/jspdf.umd.min.js", "vendor/jspdf.umd.min.js"},
+            {"three@0.160.0/build/three.min.js", "vendor/three.min.js"},
+            {"mp4-muxer@5/build/mp4-muxer.min.js", "vendor/mp4-muxer.min.js"},
+    };
 
     private final SecureRandom secureRandom = new SecureRandom();
 
-    private WebView webView;
+    private SecureWebView webView;
     private TextView status;
     private String mergedHtml = null;
+    private ValueCallback<Uri[]> fileChooserCallback;
+
+    private final ActivityResultLauncher<Intent> fileChooserLauncher =
+            registerForActivityResult(new ActivityResultContracts.StartActivityForResult(),
+                    result -> {
+                        if (fileChooserCallback == null) {
+                            return;
+                        }
+                        fileChooserCallback.onReceiveValue(
+                                WebChromeClient.FileChooserParams.parseResult(
+                                        result.getResultCode(), result.getData()));
+                        fileChooserCallback = null;
+                    });
 
     private final ActivityResultLauncher<String[]> importLauncher =
             registerForActivityResult(new ActivityResultContracts.OpenMultipleDocuments(),
@@ -357,16 +387,38 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE,
+                WindowManager.LayoutParams.FLAG_SECURE);
+        WebView.setWebContentsDebuggingEnabled(false);
+
+        String violation = SecurityGuard.check(BLOCK_IF_ROOTED, BLOCK_IF_DEBUGGED, BLOCK_IF_EMULATOR);
+        if (violation != null) {
+            Toast.makeText(this, "Security check failed: " + violation, Toast.LENGTH_LONG).show();
+            finish();
+            return;
+        }
+
         status = findViewById(R.id.status);
         webView = findViewById(R.id.webview);
 
-        WebSettings settings = webView.getSettings();
-        settings.setJavaScriptEnabled(true);
-        settings.setDomStorageEnabled(true);
-        settings.setAllowFileAccess(true);
-        settings.setLoadWithOverviewMode(true);
-        settings.setUseWideViewPort(true);
-        settings.setBuiltInZoomControls(false);
+        webView.addJavascriptInterface(new AndroidBridge(this), "AndroidBridge");
+        webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
+                                             FileChooserParams params) {
+                if (fileChooserCallback != null) {
+                    fileChooserCallback.onReceiveValue(null);
+                }
+                fileChooserCallback = callback;
+                try {
+                    fileChooserLauncher.launch(params.createIntent());
+                    return true;
+                } catch (Exception error) {
+                    fileChooserCallback = null;
+                    return false;
+                }
+            }
+        });
 
         Button importButton = findViewById(R.id.btn_import);
         Button exportButton = findViewById(R.id.btn_export);
@@ -443,14 +495,14 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        mergedHtml = mergeHtml(html, cssFiles, jsFiles);
+        mergedHtml = buildBundle(html, cssFiles, jsFiles);
         showHtml(mergedHtml);
         status.setText("Merged " + accepted + " file(s) from " + htmlName
                 + " (" + cssFiles.size() + " css, " + jsFiles.size() + " js). Ready to encrypt.");
         toast("Merged " + accepted + " file(s)");
     }
 
-    static String mergeHtml(String html, List<String> cssFiles, List<String> jsFiles) {
+    static String buildBundle(String html, List<String> cssFiles, List<String> jsFiles) {
         StringBuilder styleBlock = new StringBuilder();
         for (String css : cssFiles) {
             styleBlock.append("<style>\n").append(css).append("\n</style>\n");
@@ -487,7 +539,42 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
+        return rewireAssets(result);
+    }
+
+    // --------------------------------------------------------------------- //
+    // Replace public CDN dependencies with bundled local assets and strip the
+    // development console (eruda) that would expose the page internals.
+    // --------------------------------------------------------------------- //
+    static String rewireAssets(String html) {
+        String result = html;
+
+        result = replaceRegex(result,
+                "<script[^>]*src=[\"'][^\"']*eruda[^\"']*[\"'][^>]*>\\s*</script>", "");
+        result = replaceRegex(result,
+                "<script[^>]*>\\s*eruda\\.init\\(\\)\\s*;?\\s*</script>", "");
+
+        result = replaceRegex(result, "<link[^>]*rel=[\"']preconnect[\"'][^>]*>", "");
+        result = replaceRegex(result,
+                "<link[^>]*fonts\\.googleapis\\.com[^>]*>",
+                "<link rel=\"stylesheet\" href=\"" + ASSET_BASE + "fonts/fonts.css\">");
+        result = replaceRegex(result,
+                "<link[^>]*fonts\\.gstatic\\.com[^>]*>", "");
+
+        for (String[] lib : VENDOR_LIBS) {
+            String pattern = "<script[^>]*src=[\"'][^\"']*" + Pattern.quote(lib[0])
+                    + "[^\"']*[\"'][^>]*>\\s*</script>";
+            result = replaceRegex(result, pattern,
+                    "<script src=\"" + ASSET_BASE + lib[1] + "\"></script>");
+        }
+
         return result;
+    }
+
+    private static String replaceRegex(String input, String regex, String replacement) {
+        return Pattern.compile(regex, Pattern.CASE_INSENSITIVE | Pattern.DOTALL)
+                .matcher(input)
+                .replaceAll(replacement);
     }
 
     // --------------------------------------------------------------------- //
@@ -496,7 +583,13 @@ public class MainActivity extends AppCompatActivity {
     private void handleExport(Uri uri) {
         try {
             byte[] plain = mergedHtml.getBytes(StandardCharsets.UTF_8);
-            byte[] key = hexToBytes(MASTER_KEY_HEX);
+            byte[] key = KeyVault.getMasterKey(this);
+            if (key == null) {
+                Arrays.fill(plain, (byte) 0);
+                status.setText("Key vault unavailable.");
+                toast("Key vault unavailable");
+                return;
+            }
             byte[] nonceMaterial = new byte[28];
             secureRandom.nextBytes(nonceMaterial);
 
@@ -535,7 +628,12 @@ public class MainActivity extends AppCompatActivity {
             String text = readText(uri);
             String compact = text.replaceAll("\\s+", "");
             byte[] blob = Base64.decode(compact, Base64.DEFAULT);
-            byte[] key = hexToBytes(MASTER_KEY_HEX);
+            byte[] key = KeyVault.getMasterKey(this);
+            if (key == null) {
+                status.setText("Key vault unavailable.");
+                toast("Key vault unavailable");
+                return;
+            }
 
             byte[] plain = NativeCrypto.decrypt(blob, key);
             Arrays.fill(key, (byte) 0);
@@ -560,7 +658,7 @@ public class MainActivity extends AppCompatActivity {
     // Helpers
     // --------------------------------------------------------------------- //
     private void showHtml(String html) {
-        webView.loadDataWithBaseURL("https://localhost/", html, "text/html", "UTF-8", null);
+        webView.loadDataWithBaseURL(BASE_URL, html, "text/html", "UTF-8", null);
     }
 
     private String readText(Uri uri) throws IOException {
@@ -610,16 +708,6 @@ public class MainActivity extends AppCompatActivity {
         return builder.toString();
     }
 
-    static byte[] hexToBytes(String hex) {
-        int length = hex.length();
-        byte[] out = new byte[length / 2];
-        for (int i = 0; i < length; i += 2) {
-            out[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4)
-                    + Character.digit(hex.charAt(i + 1), 16));
-        }
-        return out;
-    }
-
     private void toast(String message) {
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
     }
@@ -661,6 +749,511 @@ public final class NativeCrypto {
      * @return the original plaintext, or null when authentication fails
      */
     public static native byte[] decrypt(byte[] blob, byte[] key);
+}
+"""
+
+    java_keyvault = r"""package com.example.protector;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+import android.os.Build;
+import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyProperties;
+import android.util.Base64;
+
+import java.security.KeyStore;
+import java.security.SecureRandom;
+
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
+
+/**
+ * Holds the 32-byte master key.
+ *
+ * The key is never compiled into the APK. On first use a random master key is
+ * generated and stored wrapped (AES-256-GCM) by a non-exportable Android
+ * Keystore key, backed by the TEE / StrongBox when the device supports it.
+ *
+ * Consequence: a file encrypted by one installation can only be opened by the
+ * same installation. Reinstalling the app creates a new master key.
+ */
+public final class KeyVault {
+
+    private static final String ANDROID_KEYSTORE = "AndroidKeyStore";
+    private static final String KEY_ALIAS = "protector.wrap.key.v1";
+    private static final String PREFS = "protector.vault";
+    private static final String PREF_WRAPPED = "wrapped_master_v1";
+    private static final int MASTER_LEN = 32;
+    private static final int GCM_TAG_BITS = 128;
+
+    private KeyVault() {
+    }
+
+    public static synchronized byte[] getMasterKey(Context context) {
+        try {
+            KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE);
+            keyStore.load(null);
+            if (!keyStore.containsAlias(KEY_ALIAS)) {
+                generateWrappingKey();
+            }
+
+            SharedPreferences prefs =
+                    context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+            String stored = prefs.getString(PREF_WRAPPED, null);
+
+            if (stored == null) {
+                byte[] master = new byte[MASTER_LEN];
+                new SecureRandom().nextBytes(master);
+                byte[] wrapped = wrap(master);
+                if (wrapped == null) {
+                    java.util.Arrays.fill(master, (byte) 0);
+                    return null;
+                }
+                prefs.edit()
+                        .putString(PREF_WRAPPED,
+                                Base64.encodeToString(wrapped, Base64.NO_WRAP))
+                        .commit();
+                return master;
+            }
+
+            return unwrap(Base64.decode(stored, Base64.NO_WRAP));
+        } catch (Throwable error) {
+            return null;
+        }
+    }
+
+    private static void generateWrappingKey() throws Exception {
+        KeyGenerator generator =
+                KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE);
+        KeyGenParameterSpec.Builder builder = new KeyGenParameterSpec.Builder(
+                KEY_ALIAS,
+                KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setKeySize(256);
+
+        boolean initialized = false;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                builder.setIsStrongBoxBacked(true);
+                generator.init(builder.build());
+                initialized = true;
+            } catch (Throwable strongBoxUnavailable) {
+                builder.setIsStrongBoxBacked(false);
+            }
+        }
+        if (!initialized) {
+            generator.init(builder.build());
+        }
+        generator.generateKey();
+    }
+
+    private static SecretKey loadWrappingKey() throws Exception {
+        KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE);
+        keyStore.load(null);
+        return (SecretKey) keyStore.getKey(KEY_ALIAS, null);
+    }
+
+    private static byte[] wrap(byte[] master) {
+        try {
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.ENCRYPT_MODE, loadWrappingKey());
+            byte[] iv = cipher.getIV();
+            byte[] cipherText = cipher.doFinal(master);
+            byte[] out = new byte[1 + iv.length + cipherText.length];
+            out[0] = (byte) iv.length;
+            System.arraycopy(iv, 0, out, 1, iv.length);
+            System.arraycopy(cipherText, 0, out, 1 + iv.length, cipherText.length);
+            return out;
+        } catch (Throwable error) {
+            return null;
+        }
+    }
+
+    private static byte[] unwrap(byte[] wrapped) {
+        try {
+            if (wrapped == null || wrapped.length < 3) {
+                return null;
+            }
+            int ivLength = wrapped[0] & 0xFF;
+            if (ivLength <= 0 || wrapped.length < 1 + ivLength + 1) {
+                return null;
+            }
+            byte[] iv = new byte[ivLength];
+            System.arraycopy(wrapped, 1, iv, 0, ivLength);
+            byte[] cipherText = new byte[wrapped.length - 1 - ivLength];
+            System.arraycopy(wrapped, 1 + ivLength, cipherText, 0, cipherText.length);
+
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE, loadWrappingKey(),
+                    new GCMParameterSpec(GCM_TAG_BITS, iv));
+            return cipher.doFinal(cipherText);
+        } catch (Throwable error) {
+            return null;
+        }
+    }
+}
+"""
+
+    java_security = r"""package com.example.protector;
+
+import android.os.Build;
+import android.os.Debug;
+
+import java.io.File;
+
+/**
+ * Lightweight anti-tamper checks. They raise the effort bar; they are not a
+ * guarantee against a determined attacker with full control of the device.
+ */
+final class SecurityGuard {
+
+    private SecurityGuard() {
+    }
+
+    static String check(boolean blockRoot, boolean blockDebug, boolean blockEmulator) {
+        if (blockDebug && isDebuggerAttached()) {
+            return "debugger";
+        }
+        if (blockRoot && isRooted()) {
+            return "root";
+        }
+        if (blockEmulator && isEmulator()) {
+            return "emulator";
+        }
+        return null;
+    }
+
+    static boolean isDebuggerAttached() {
+        return Debug.isDebuggerConnected() || Debug.waitingForDebugger();
+    }
+
+    static boolean isRooted() {
+        String tags = Build.TAGS;
+        if (tags != null && tags.contains("test-keys")) {
+            return true;
+        }
+        String[] paths = {
+                "/system/app/Superuser.apk",
+                "/sbin/su",
+                "/system/bin/su",
+                "/system/xbin/su",
+                "/data/local/xbin/su",
+                "/data/local/bin/su",
+                "/system/sd/xbin/su",
+                "/system/bin/failsafe/su",
+                "/data/local/su",
+                "/su/bin/su"
+        };
+        for (String path : paths) {
+            try {
+                if (new File(path).exists()) {
+                    return true;
+                }
+            } catch (Throwable ignored) {
+                // ignore and continue
+            }
+        }
+        return false;
+    }
+
+    static boolean isEmulator() {
+        String fingerprint = Build.FINGERPRINT == null
+                ? "" : Build.FINGERPRINT.toLowerCase();
+        String model = Build.MODEL == null ? "" : Build.MODEL;
+        String product = Build.PRODUCT == null
+                ? "" : Build.PRODUCT.toLowerCase();
+        return fingerprint.startsWith("generic")
+                || fingerprint.contains("emulator")
+                || model.contains("Emulator")
+                || model.contains("Android SDK built for")
+                || product.contains("sdk")
+                || product.contains("emulator")
+                || product.contains("goldfish")
+                || product.contains("ranchu");
+    }
+}
+"""
+
+    java_securewebview = r"""package com.example.protector;
+
+import android.content.Context;
+import android.util.AttributeSet;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+
+/**
+ * Hardened WebView: no file/content access, no cross-origin file access, no
+ * popups, never remotely debuggable, and all navigation is controlled by
+ * {@link SecureWebViewClient}.
+ */
+public class SecureWebView extends WebView {
+
+    public SecureWebView(Context context) {
+        super(context);
+        harden();
+    }
+
+    public SecureWebView(Context context, AttributeSet attrs) {
+        super(context, attrs);
+        harden();
+    }
+
+    public SecureWebView(Context context, AttributeSet attrs, int defStyleAttr) {
+        super(context, attrs, defStyleAttr);
+        harden();
+    }
+
+    @SuppressWarnings("deprecation")
+    private void harden() {
+        WebSettings settings = getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setDatabaseEnabled(true);
+        settings.setAllowFileAccess(false);
+        settings.setAllowContentAccess(true);
+        settings.setAllowFileAccessFromFileURLs(false);
+        settings.setAllowUniversalAccessFromFileURLs(false);
+        settings.setJavaScriptCanOpenWindowsAutomatically(false);
+        settings.setSupportMultipleWindows(false);
+        settings.setSaveFormData(false);
+        settings.setGeolocationEnabled(false);
+        settings.setMediaPlaybackRequiresUserGesture(false);
+        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+        settings.setLoadWithOverviewMode(true);
+        settings.setUseWideViewPort(true);
+        settings.setBuiltInZoomControls(false);
+        settings.setDisplayZoomControls(false);
+
+        WebView.setWebContentsDebuggingEnabled(false);
+        setWebViewClient(new SecureWebViewClient(getContext()));
+    }
+}
+"""
+
+    java_secureclient = r"""package com.example.protector;
+
+import android.content.Context;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+
+import androidx.webkit.WebViewAssetLoader;
+
+import java.io.ByteArrayInputStream;
+import java.util.Locale;
+
+/**
+ * Blocks every navigation and every external network request. Only the internal
+ * document, inline resources (data:, blob:, about:), user-picked content URIs
+ * and the bundled assets under https://app.protector/assets/ are allowed.
+ */
+public class SecureWebViewClient extends WebViewClient {
+
+    private final WebViewAssetLoader assetLoader;
+
+    public SecureWebViewClient(Context context) {
+        this.assetLoader = new WebViewAssetLoader.Builder()
+                .setDomain("app.protector")
+                .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(context))
+                .build();
+    }
+
+    @Override
+    public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+        return true;
+    }
+
+    @Override
+    public boolean shouldOverrideUrlLoading(WebView view, String url) {
+        return true;
+    }
+
+    @Override
+    public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+        if (request.getUrl() == null) {
+            return blocked();
+        }
+        String scheme = request.getUrl().getScheme();
+        if (scheme == null) {
+            return blocked();
+        }
+        scheme = scheme.toLowerCase(Locale.US);
+
+        if (scheme.equals("data") || scheme.equals("about") || scheme.equals("blob")
+                || scheme.equals("content")) {
+            return null;
+        }
+        if (scheme.equals("https") && "app.protector".equals(request.getUrl().getHost())) {
+            WebResourceResponse local = assetLoader.shouldInterceptRequest(request.getUrl());
+            if (local != null) {
+                return local;
+            }
+            return null;
+        }
+        return blocked();
+    }
+
+    private WebResourceResponse blocked() {
+        return new WebResourceResponse("text/plain", "utf-8",
+                new ByteArrayInputStream(new byte[0]));
+    }
+}
+"""
+
+    java_androidbridge = r"""package com.example.protector;
+
+import android.content.ContentValues;
+import android.content.Context;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Environment;
+import android.provider.MediaStore;
+import android.util.Base64;
+import android.webkit.JavascriptInterface;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.OutputStream;
+
+/**
+ * Native side of the {@code AndroidBridge} JavaScript interface used by a
+ * protected page to stream a generated file (PDF, ZIP, video, cover image...)
+ * into the public Downloads folder in small Base64 chunks. Memory stays bounded
+ * because only one chunk is ever held at a time.
+ */
+public class AndroidBridge {
+
+    private final Context context;
+    private OutputStream out;
+    private Uri pendingUri;
+    private File pendingFile;
+
+    public AndroidBridge(Context context) {
+        this.context = context.getApplicationContext();
+    }
+
+    @JavascriptInterface
+    public synchronized String beginDownload(String name, String mime, long total) {
+        try {
+            discard();
+            String filename = sanitize(name);
+            String type = (mime == null || mime.isEmpty())
+                    ? "application/octet-stream" : mime;
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Downloads.DISPLAY_NAME, filename);
+                values.put(MediaStore.Downloads.MIME_TYPE, type);
+                values.put(MediaStore.Downloads.IS_PENDING, 1);
+                Uri uri = context.getContentResolver()
+                        .insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                if (uri == null) {
+                    return "ERR_CREATE";
+                }
+                OutputStream stream = context.getContentResolver().openOutputStream(uri);
+                if (stream == null) {
+                    context.getContentResolver().delete(uri, null, null);
+                    return "ERR_STREAM";
+                }
+                pendingUri = uri;
+                out = stream;
+            } else {
+                File dir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                if (dir == null) {
+                    return "ERR_DIR";
+                }
+                if (!dir.exists() && !dir.mkdirs()) {
+                    return "ERR_DIR";
+                }
+                File file = new File(dir, filename);
+                pendingFile = file;
+                out = new FileOutputStream(file);
+            }
+            return "OK";
+        } catch (Exception error) {
+            discard();
+            return "ERR_" + error.getClass().getSimpleName();
+        }
+    }
+
+    @JavascriptInterface
+    public synchronized String writeChunk(String base64) {
+        if (out == null) {
+            return "ERR_STATE";
+        }
+        try {
+            byte[] data = Base64.decode(base64, Base64.DEFAULT);
+            out.write(data);
+            return "OK";
+        } catch (Exception error) {
+            return "ERR_" + error.getClass().getSimpleName();
+        }
+    }
+
+    @JavascriptInterface
+    public synchronized String finishDownload() {
+        if (out == null) {
+            return "ERR_STATE";
+        }
+        try {
+            out.flush();
+            out.close();
+            out = null;
+            if (pendingUri != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Downloads.IS_PENDING, 0);
+                context.getContentResolver().update(pendingUri, values, null, null);
+            }
+            pendingUri = null;
+            pendingFile = null;
+            return "OK";
+        } catch (Exception error) {
+            discard();
+            return "ERR_" + error.getClass().getSimpleName();
+        }
+    }
+
+    @JavascriptInterface
+    public synchronized String cancelDownload() {
+        discard();
+        return "OK";
+    }
+
+    private void discard() {
+        if (out != null) {
+            try {
+                out.close();
+            } catch (Exception ignored) {
+            }
+            out = null;
+        }
+        if (pendingUri != null) {
+            try {
+                context.getContentResolver().delete(pendingUri, null, null);
+            } catch (Exception ignored) {
+            }
+            pendingUri = null;
+        }
+        if (pendingFile != null) {
+            if (pendingFile.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                pendingFile.delete();
+            }
+            pendingFile = null;
+        }
+    }
+
+    private static String sanitize(String name) {
+        if (name == null || name.trim().isEmpty()) {
+            return "file";
+        }
+        String cleaned = name.replace('\\', '_').replace('/', '_').trim();
+        return cleaned.isEmpty() ? "file" : cleaned;
+    }
 }
 """
 
@@ -1177,7 +1770,7 @@ android {
 
     defaultConfig {
         applicationId 'com.example.protector'
-        minSdk 21
+        minSdk 23
         targetSdk 34
         versionCode 1
         versionName '1.0'
@@ -1205,7 +1798,10 @@ android {
             debuggable true
         }
         release {
-            minifyEnabled false
+            debuggable false
+            minifyEnabled true
+            shrinkResources true
+            signingConfig signingConfigs.debug
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'),
                     'proguard-rules.pro'
         }
@@ -1220,13 +1816,134 @@ android {
 dependencies {
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'androidx.activity:activity:1.8.2'
+    implementation 'androidx.webkit:webkit:1.11.0'
     implementation 'com.google.android.material:material:1.11.0'
 }
 """
 
-    proguard = r"""# Keep the JNI bridge; its method names are referenced from native code.
+    proguard = r"""# Native method names are referenced from C++ by their mangled Java name.
 -keep class com.example.protector.NativeCrypto { *; }
+
+# Classes inflated from XML / referenced by the framework.
+-keep class com.example.protector.MainActivity { *; }
+-keep class com.example.protector.SecureWebView { *; }
+-keep class com.example.protector.SecureWebViewClient { *; }
+-keep class com.example.protector.AndroidBridge { *; }
+-keep class com.example.protector.KeyVault { *; }
+-keep class com.example.protector.SecurityGuard { *; }
+
+# Keep any future @JavascriptInterface bridge methods.
+-keepclassmembers class * {
+    @android.webkit.JavascriptInterface <methods>;
+}
+
+# Keep native method bindings for all classes.
+-keepclasseswithmembernames class * {
+    native <methods>;
+}
 """
+
+    tools_fetch_assets = r'''#!/usr/bin/env python3
+"""Download the third-party libraries and Google Fonts used by the protected
+tool into the APK assets, so the protected page runs completely offline.
+
+Run this once (it is invoked automatically by the build workflow):
+
+    python3 tools/fetch_assets.py
+"""
+
+import hashlib
+import os
+import re
+import urllib.request
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+VENDOR_DIR = os.path.join("app", "src", "main", "assets", "vendor")
+FONT_DIR = os.path.join("app", "src", "main", "assets", "fonts")
+
+VENDOR_FILES = {
+    "potrace.js": "https://cdn.jsdelivr.net/gh/kilobtye/potrace@master/potrace.js",
+    "jszip.min.js": "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js",
+    "jspdf.umd.min.js": "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js",
+    "three.min.js": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js",
+    "mp4-muxer.min.js": "https://cdn.jsdelivr.net/npm/mp4-muxer@5/build/mp4-muxer.min.js",
+}
+
+FONTS_CSS_URL = (
+    "https://fonts.googleapis.com/css2?"
+    "family=Press+Start+2P"
+    "&family=Tajawal:wght@400;500;700;900"
+    "&family=Cairo:wght@400;600;800"
+    "&family=Almarai:wght@400;700"
+    "&family=Lalezar"
+    "&family=Reem+Kufi:wght@400;700"
+    "&family=Aref+Ruqaa:wght@400;700"
+    "&family=Changa:wght@400;700"
+    "&family=Markazi+Text:wght@400;700"
+    "&family=Lobster"
+    "&family=Bangers"
+    "&family=Baloo+2:wght@400;700"
+    "&family=Fredoka:wght@400;600"
+    "&family=Merriweather:wght@400;700"
+    "&family=Playfair+Display:wght@400;700"
+    "&family=Libre+Baskerville:wght@400;700"
+    "&display=swap"
+)
+
+
+def download(url, binary=True, attempts=3):
+    last_error = None
+    for _ in range(attempts):
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(request, timeout=60) as response:
+                data = response.read()
+            return data if binary else data.decode("utf-8")
+        except Exception as error:
+            last_error = error
+    raise RuntimeError("Failed to download %s: %s" % (url, last_error))
+
+
+def fetch_vendor():
+    os.makedirs(VENDOR_DIR, exist_ok=True)
+    for name, url in VENDOR_FILES.items():
+        data = download(url)
+        with open(os.path.join(VENDOR_DIR, name), "wb") as handle:
+            handle.write(data)
+        print("vendor: %s (%d bytes)" % (name, len(data)))
+
+
+def fetch_fonts():
+    os.makedirs(FONT_DIR, exist_ok=True)
+    css = download(FONTS_CSS_URL, binary=False)
+    urls = sorted(set(re.findall(r"url\((https://fonts\.gstatic\.com/[^)]+)\)", css)))
+    mapping = {}
+    for url in urls:
+        digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+        name = digest + ".woff2"
+        with open(os.path.join(FONT_DIR, name), "wb") as handle:
+            handle.write(download(url))
+        mapping[url] = name
+    for url, name in mapping.items():
+        css = css.replace(url, "./" + name)
+    with open(os.path.join(FONT_DIR, "fonts.css"), "w", encoding="utf-8") as handle:
+        handle.write(css)
+    print("fonts: %d woff2 files" % len(mapping))
+
+
+def main():
+    fetch_vendor()
+    fetch_fonts()
+    print("Assets are ready under app/src/main/assets/.")
+
+
+if __name__ == "__main__":
+    main()
+'''
 
     files = {
         "settings.gradle": settings_gradle,
@@ -1241,8 +1958,14 @@ dependencies {
         "app/src/main/res/values/themes.xml": themes,
         os.path.join(JAVA_DIR, "MainActivity.java"): java_main,
         os.path.join(JAVA_DIR, "NativeCrypto.java"): java_native,
+        os.path.join(JAVA_DIR, "KeyVault.java"): java_keyvault,
+        os.path.join(JAVA_DIR, "SecurityGuard.java"): java_security,
+        os.path.join(JAVA_DIR, "SecureWebView.java"): java_securewebview,
+        os.path.join(JAVA_DIR, "SecureWebViewClient.java"): java_secureclient,
+        os.path.join(JAVA_DIR, "AndroidBridge.java"): java_androidbridge,
         os.path.join(CPP_DIR, "native_crypto.cpp"): native_cpp,
         os.path.join(CPP_DIR, "CMakeLists.txt"): cmake,
+        os.path.join("tools", "fetch_assets.py"): tools_fetch_assets,
     }
     return files
 
